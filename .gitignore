@@ -1,0 +1,5 @@
+data/*.log
+data/state_*.json
+data/tasks.json
+__pycache__/
+*.pyc

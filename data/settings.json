@@ -1,0 +1,11 @@
+{
+  "parallel": 3,
+  "batch_size": 5,
+  "max_tasks": 3,
+  "global_concurrency": 6,
+  "max_data_gb": 0,
+  "disk_reserve_gb": 2,
+  "delay": 0.2,
+  "firebase_url": "",
+  "firebase_token": ""
+}

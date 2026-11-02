@@ -1,0 +1,14 @@
+{
+  "name": "Copy Bot",
+  "image": "mcr.microsoft.com/devcontainers/python:3.12",
+  "postCreateCommand": "bash .devcontainer/start.sh",
+  "postStartCommand": "bash .devcontainer/resume.sh",
+  "features": {},
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "workbench.startupEditor": "readme.md"
+      }
+    }
+  }
+}
