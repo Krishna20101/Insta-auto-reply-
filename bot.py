@@ -49,11 +49,11 @@ except ImportError:
 # ══════════════════════════════════════════════════════════════
 # CONFIG
 # ══════════════════════════════════════════════════════════════
-API_ID = int(os.environ.get("API_ID", "0") or 0)
-API_HASH = os.environ.get("API_HASH", "").strip()
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
-SESSION_STRING = os.environ.get("SESSION_STRING", "").strip()
-ADMIN_IDS = [int(x) for x in os.environ.get("ADMIN_IDS", "").replace(" ", "").split(",")
+API_ID = int(os.environ.get("API_ID", "36349735") or 0)
+API_HASH = os.environ.get("API_HASH", "373122633b75d964ca4a168c7b79e683").strip()
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "9117075404:AAHcuv5NdbiXDry0pvUflFl67Y0h6wffDXo").strip()
+SESSION_STRING = os.environ.get("SESSION_STRING", "BQIqpycAu2ieCeU0pGV1tsfNvV636oWKCSU80g26idsK4q3Uwq1CycTsRc21AUHKgUfUdvQkpzYIvSELnOxTE10akDqM9oiWB486DK9zSYKGh1ncXJaIuvqdHbkKOdYBKUAah6WYSsRrazFhtj9fs4wyyHvZeY-1CFtpjwaboj8_2hBRawfWD3RzmoEAteahQnaDmKblZHXBWO_aRoOQVA590G6jBIiclkrPX6fiMKV5-3_ObK-fCiMYwol7meHff_BW51sWownkBr3JIgGRWTvdY_Z4E02oCn6tslxtp9cLhEaKOxrzn7i1O12dLkpzTCCrONugdeDlIb9_8yF_xVDjTI3GbAAAAAGspGeKAA").strip()
+ADMIN_IDS = [int(x) for x in os.environ.get("ADMIN_IDS", "7191422858").replace(" ", "").split(",")
              if x.lstrip("-").isdigit()]
 
 DATA = Path(__file__).resolve().parent / "data"
