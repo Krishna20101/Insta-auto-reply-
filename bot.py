@@ -1041,4 +1041,7 @@ async def main():
     await bot.stop()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    # Pyrogram clients and dispatcher workers use the Client's event loop.
+    # Running main() via asyncio.run() creates a second loop and can make
+    # bot.stop() fail with "Future attached to a different loop".
+    bot.run(main())
