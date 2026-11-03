@@ -1,26 +1,16 @@
+
 """
 ╔══════════════════════════════════════════════════════════════════════════╗
-║  COPY BOT (GitHub / Codespaces / Render ready)                          ║
-║  Telegram se poora control — koi terminal ki zarurat nahi               ║
-║                                                                          ║
-║  ENV (GitHub Codespaces Secrets ya Render Environment):                  ║
-║    API_ID, API_HASH, BOT_TOKEN, SESSION_STRING, ADMIN_IDS                 ║
-║                                                                          ║
-║  FEATURES                                                                 ║
-║   • ➕ New Task — source → target(s) → count/all → filter → parallel      ║
-║   • 2-3 tasks ek saath (global concurrency cap = flood safe)             ║
-║   • copy: 1) copy_message  2) file_id (0 data)  3) download+upload       ║
-║   • batch of N (default 5): har batch ke baad sab-done check + retry     ║
-║   • durable state: crash/restart par wahin se resume, koi file 2 baar    ║
-║     nahi (done skip + inflight verify against target)                    ║
-║   • 📊 Progress — kitna hua, kitna baaki, speed, ETA, data used          ║
-║   • Pause / Resume / Cancel / Retry failed                               ║
-║   • 0-data counter, data limit guard, disk guard                         ║
+║  COPY BOT v2 — GitHub Codespaces / Render ready                         ║
+║  Stream-delete mode: upload hote hi local file delete                   ║
+║  Restricted channel support: seedha download+upload                     ║
 ╚══════════════════════════════════════════════════════════════════════════╝
+
+ENV — .env file ya seedha neeche HARD_* variables mein bhar do:
+    API_ID, API_HASH, BOT_TOKEN, SESSION_STRING, ADMIN_IDS
 """
 
 import asyncio
-import functools
 import html as htmlmod
 import json
 import logging
@@ -29,49 +19,72 @@ import shutil
 import sys
 import tempfile
 import time
-import urllib.parse
-import urllib.request
 from pathlib import Path
 
 try:
     from pyrogram import Client, filters, enums, idle
     from pyrogram.errors import (
-        FloodWait, UserNotParticipant, ChatAdminRequired, ChannelPrivate,
-        ChatForbidden, ChannelInvalid, RPCError,
+        FloodWait, RPCError,
     )
     from pyrogram.types import (
         Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
     )
 except ImportError:
-    print("❌ pyrogram nahi hai. Chalao: pip install pyrofork aiohttp")
+    print("pip install pyrofork aiohttp")
     sys.exit(1)
 
 # ══════════════════════════════════════════════════════════════
-# CONFIG
+# .env loader
 # ══════════════════════════════════════════════════════════════
-API_ID = int(os.environ.get("API_ID", "36349735") or 0)
-API_HASH = os.environ.get("API_HASH", "373122633b75d964ca4a168c7b79e683").strip()
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "9117075404:AAHcuv5NdbiXDry0pvUflFl67Y0h6wffDXo").strip()
-SESSION_STRING = os.environ.get("SESSION_STRING", "BQIqpycAu2ieCeU0pGV1tsfNvV636oWKCSU80g26idsK4q3Uwq1CycTsRc21AUHKgUfUdvQkpzYIvSELnOxTE10akDqM9oiWB486DK9zSYKGh1ncXJaIuvqdHbkKOdYBKUAah6WYSsRrazFhtj9fs4wyyHvZeY-1CFtpjwaboj8_2hBRawfWD3RzmoEAteahQnaDmKblZHXBWO_aRoOQVA590G6jBIiclkrPX6fiMKV5-3_ObK-fCiMYwol7meHff_BW51sWownkBr3JIgGRWTvdY_Z4E02oCn6tslxtp9cLhEaKOxrzn7i1O12dLkpzTCCrONugdeDlIb9_8yF_xVDjTI3GbAAAAAGspGeKAA").strip()
-ADMIN_IDS = [int(x) for x in os.environ.get("ADMIN_IDS", "7191422858").replace(" ", "").split(",")
-             if x.lstrip("-").isdigit()]
+def _load_dotenv():
+    here = Path(__file__).resolve().parent
+    for name in (".env", "data/.env"):
+        f = here / name
+        if not f.exists():
+            continue
+        for line in f.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            k, v = k.strip(), v.strip().strip('"').strip("'")
+            if k and not os.environ.get(k):
+                os.environ[k] = v
+
+_load_dotenv()
+
+# ══════════════════════════════════════════════════════════════
+# CONFIG — yahan apni values bhar do
+# ══════════════════════════════════════════════════════════════
+HARD_API_ID       = 36349735       # e.g. 12345678
+HARD_API_HASH     = "373122633b75d964ca4a168c7b79e683"       # "abcdef1234567890abcdef1234567890"
+HARD_BOT_TOKEN    = "9117075404:AAHcuv5NdbiXDry0pvUflFl67Y0h6wffDXo"       # "123456789:AAxxxx"
+HARD_SESSION_STRING = "BQIqpycAu2ieCeU0pGV1tsfNvV636oWKCSU80g26idsK4q3Uwq1CycTsRc21AUHKgUfUdvQkpzYIvSELnOxTE10akDqM9oiWB486DK9zSYKGh1ncXJaIuvqdHbkKOdYBKUAah6WYSsRrazFhtj9fs4wyyHvZeY-1CFtpjwaboj8_2hBRawfWD3RzmoEAteahQnaDmKblZHXBWO_aRoOQVA590G6jBIiclkrPX6fiMKV5-3_ObK-fCiMYwol7meHff_BW51sWownkBr3JIgGRWTvdY_Z4E02oCn6tslxtp9cLhEaKOxrzn7i1O12dLkpzTCCrONugdeDlIb9_8yF_xVDjTI3GbAAAAAGspGeKAA"     # "BQxxxx..."  (Pyrogram session)
+HARD_ADMIN_IDS    = ""       # "7191422858" ya "123456789,987654321"
+
+API_ID   = int(os.environ.get("API_ID", "0") or 0) or int(HARD_API_ID or 0)
+API_HASH = (os.environ.get("API_HASH", "") or HARD_API_HASH or "").strip()
+BOT_TOKEN = (os.environ.get("BOT_TOKEN", "") or HARD_BOT_TOKEN or "").strip()
+SESSION_STRING = (os.environ.get("SESSION_STRING", "") or HARD_SESSION_STRING or "").strip()
+_ids = os.environ.get("ADMIN_IDS", "") or HARD_ADMIN_IDS or ""
+ADMIN_IDS = [int(x) for x in _ids.replace(" ", "").split(",") if x.lstrip("-").isdigit()]
 
 DATA = Path(__file__).resolve().parent / "data"
 DATA.mkdir(parents=True, exist_ok=True)
-SETTINGS_FILE = DATA / "settings.json"
 
+# ══════════════════════════════════════════════════════════════
+# SETTINGS
+# ══════════════════════════════════════════════════════════════
 SETTINGS = {
-    "parallel": 3,          # ek task ke andar ek saath kitni files
-    "batch_size": 5,        # har N ke baad barrier + retry
-    "max_tasks": 3,         # ek saath kitne tasks
-    "global_concurrency": 6,  # sab tasks mila ke max parallel copies
-    "max_data_gb": 0,       # 0 = no limit (download+upload mode ka data guard)
-    "disk_reserve_gb": 2,
-    "delay": 0.2,
-    "firebase_url": "",
-    "firebase_token": "",
+    "parallel": 2,          # ek task mein ek saath kitni files
+    "batch_size": 5,
+    "max_tasks": 3,
+    "global_concurrency": 4,
+    "disk_reserve_gb": 1,
+    "delay": 0.3,
 }
 
+SETTINGS_FILE = DATA / "settings.json"
 
 def load_settings():
     if SETTINGS_FILE.exists():
@@ -80,14 +93,15 @@ def load_settings():
         except Exception:
             pass
 
-
 def save_settings():
     try:
-        SETTINGS_FILE.write_text(json.dumps(SETTINGS, ensure_ascii=False, indent=1))
+        SETTINGS_FILE.write_text(json.dumps(SETTINGS, indent=1))
     except Exception:
         pass
 
-
+# ══════════════════════════════════════════════════════════════
+# LOGGING
+# ══════════════════════════════════════════════════════════════
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -96,18 +110,15 @@ logging.basicConfig(
 logging.getLogger("pyrogram").setLevel(logging.WARNING)
 log = logging.getLogger("CB")
 
-MEDIA = ("video", "document", "photo", "audio", "voice", "animation", "sticker")
-SAVED = ("me", "self", "saved", "saved messages", "savedmessages")
-WRITE_ERR = ("ChatWriteForbidden", "CHAT_WRITE_FORBIDDEN", "ChatAdminRequired",
-             "CHAT_ADMIN_REQUIRED", "ChatRestricted", "ChannelPrivate")
-
-
 # ══════════════════════════════════════════════════════════════
 # HELPERS
 # ══════════════════════════════════════════════════════════════
+MEDIA = ("video", "document", "photo", "audio", "voice", "animation", "sticker")
+WRITE_ERR = ("ChatWriteForbidden", "CHAT_WRITE_FORBIDDEN", "ChatAdminRequired",
+             "CHAT_ADMIN_REQUIRED", "ChatRestricted", "ChannelPrivate", "ChatForbidden")
+
 def esc(x) -> str:
     return htmlmod.escape(str(x if x is not None else ""), quote=False)
-
 
 def hr(n) -> str:
     n = float(n or 0)
@@ -117,21 +128,11 @@ def hr(n) -> str:
         n /= 1024
     return f"{n:.1f}PB"
 
-
 def pbar(done, total, w=14) -> str:
     if not total:
         return "░" * w
     d = int(done / total * w)
     return "█" * d + "░" * (w - d)
-
-
-def is_saved(x) -> bool:
-    return isinstance(x, str) and x.strip().lower() in SAVED
-
-
-def label(x) -> str:
-    return "Saved Messages" if is_saved(x) else str(x)
-
 
 def get_media(m):
     for a in MEDIA:
@@ -140,15 +141,18 @@ def get_media(m):
             return a, o
     return None, None
 
-
 def is_admin(uid: int) -> bool:
     return not ADMIN_IDS or uid in ADMIN_IDS
-
 
 def kb(*rows):
     return InlineKeyboardMarkup(
         [[InlineKeyboardButton(t, callback_data=d) for t, d in row] for row in rows])
 
+def disk_free() -> int:
+    try:
+        return shutil.disk_usage(str(DATA)).free
+    except Exception:
+        return 0
 
 async def safe_edit(msg, text, markup=None):
     for kw in (dict(text=text, reply_markup=markup, parse_mode=enums.ParseMode.HTML),
@@ -158,72 +162,35 @@ async def safe_edit(msg, text, markup=None):
         except FloodWait as e:
             await asyncio.sleep(int(e.value) + 1)
         except Exception as e:
-            if "NotModified" in type(e).__name__:
+            nm = type(e).__name__
+            if "NotModified" in nm:
                 return None
-            if "TooLong" in type(e).__name__:
+            if "TooLong" in nm:
                 try:
                     return await msg.edit_text(text[:3900] + "…", reply_markup=markup)
                 except Exception:
                     return None
     return None
 
-
-def disk_free() -> int:
-    try:
-        return shutil.disk_usage(str(DATA)).free
-    except Exception:
-        return 0
-
+async def safe_send(client, chat_id, text, markup=None):
+    for kw in (dict(parse_mode=enums.ParseMode.HTML),{}):
+        try:
+            return await client.send_message(
+                chat_id, text, reply_markup=markup, **kw)
+        except FloodWait as e:
+            await asyncio.sleep(int(e.value) + 1)
+        except Exception:
+            pass
+    return None
 
 # ══════════════════════════════════════════════════════════════
-# STATE (per source→target, durable)
+# STATE (durable per src→dst)
 # ══════════════════════════════════════════════════════════════
-FB_WARN = {"x": False}
-
-
 def _key(src, dst) -> str:
-    return f"{str(src).replace('-', 'n')}__{str(dst).replace('-', 'n')}"
-
+    return f"{str(src).replace('-','n')}__{str(dst).replace('-','n')}"
 
 def state_path(src, dst) -> Path:
     return DATA / f"state_{_key(src, dst)}.json"
-
-
-def fb_url(src, dst) -> str | None:
-    u = (SETTINGS.get("firebase_url") or "").strip().rstrip("/")
-    if not u:
-        return None
-    tok = (SETTINGS.get("firebase_token") or "").strip()
-    q = ("?auth=" + urllib.parse.quote(tok)) if tok else ""
-    return f"{u}/rcf/{_key(src, dst)}.json{q}"
-
-
-def fb_push(st):
-    u = fb_url(st["src"], st["dst"])
-    if not u:
-        return
-    try:
-        req = urllib.request.Request(
-            u, data=json.dumps(st, ensure_ascii=False).encode(), method="PUT",
-            headers={"Content-Type": "application/json"})
-        urllib.request.urlopen(req, timeout=10).read()
-    except Exception as e:
-        if not FB_WARN["x"]:
-            log.warning(f"firebase push fail: {type(e).__name__}: {str(e)[:100]}")
-            FB_WARN["x"] = True
-
-
-def fb_pull(src, dst):
-    u = fb_url(src, dst)
-    if not u:
-        return None
-    try:
-        with urllib.request.urlopen(u, timeout=10) as r:
-            d = json.loads(r.read().decode() or "null")
-        return d if isinstance(d, dict) else None
-    except Exception:
-        return None
-
 
 def state_load(src, dst) -> dict:
     st = {"src": str(src), "dst": str(dst), "files": {}, "created": time.time(), "updated": 0}
@@ -233,355 +200,174 @@ def state_load(src, dst) -> dict:
             st.update(json.loads(p.read_text()))
         except Exception:
             pass
-    fb = fb_pull(src, dst)
-    if fb:
-        for k, v in (fb.get("files") or {}).items():
-            cur = st["files"].get(k)
-            if not cur or (cur.get("status") != "done" and v.get("status") == "done"):
-                st["files"][k] = v
     return st
 
-
-def state_save(st, push=True):
+def state_save(st):
     st["updated"] = time.time()
     try:
         p = state_path(st["src"], st["dst"])
         tmp = p.with_suffix(".tmp")
-        tmp.write_text(json.dumps(st, ensure_ascii=False, indent=1))
+        tmp.write_text(json.dumps(st, indent=1))
         tmp.replace(p)
     except Exception as e:
         log.warning(f"state save fail: {e}")
-    if push:
-        fb_push(st)
-
 
 def summary(st) -> dict:
-    c = {"done": 0, "pending": 0, "inflight": 0, "failed": 0}
+    c = {"done": 0, "pending": 0, "failed": 0}
     for v in (st.get("files") or {}).values():
         s = v.get("status", "pending")
         c[s if s in c else "pending"] += 1
     return c
 
-
-def mark(st, mid, ok, **extra):
-    rec = st["files"].setdefault(str(mid), {})
-    rec["status"] = "done" if ok else "failed"
-    rec["ts"] = time.time()
-    rec.update(extra)
-
-
 # ══════════════════════════════════════════════════════════════
 # CLIENTS
 # ══════════════════════════════════════════════════════════════
-bot = Client("cb_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN,
-             in_memory=True, workers=32, sleep_threshold=60)
-_acc: Client | None = None
+bot = Client(
+    "cb_bot",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    bot_token=BOT_TOKEN,
+    in_memory=True,
+    workers=16,
+    sleep_threshold=60,
+)
 
+_acc: Client | None = None
+_acc_lock = asyncio.Lock()
 
 async def acc_client() -> Client:
     global _acc
-    if _acc and _acc.is_connected:
+    async with _acc_lock:
+        if _acc and _acc.is_connected:
+            return _acc
+        _acc = Client(
+            "cb_user",
+            api_id=API_ID,
+            api_hash=API_HASH,
+            session_string=SESSION_STRING,
+            in_memory=True,
+            no_updates=True,
+            workers=32,
+            sleep_threshold=60,
+        )
+        await _acc.start()
+        me = await _acc.get_me()
+        log.info(f"user account: {me.first_name} ({me.id})")
         return _acc
-    _acc = Client("cb_user", api_id=API_ID, api_hash=API_HASH,
-                  session_string=SESSION_STRING, in_memory=True, no_updates=True,
-                  workers=64, sleep_threshold=60)
-    await _acc.start()
-    log.info("user account connected")
-    return _acc
-
 
 # ══════════════════════════════════════════════════════════════
-# COPY ENGINE
+# TRANSFER ENGINE — stream-delete mode
 # ══════════════════════════════════════════════════════════════
 class StopTask(Exception):
     pass
 
-
-class Budget:
-    """data limit + disk guard, parallel-safe (per task)."""
-
-    def __init__(self, max_bytes=0, reserve=0):
-        self.max = max_bytes
-        self.reserve = reserve
-        self.used = 0
-        self._lock = asyncio.Lock()
-
-    async def claim(self, size):
-        async with self._lock:
-            if self.max and self.used + size * 2 > self.max:
-                raise StopTask(f"data limit ({hr(self.max)}) paar ho rahi thi — "
-                               f"ab tak {hr(self.used)}")
-            free = disk_free()
-            need = int(size * 1.3) + self.reserve + self.used
-            if free and free < need:
-                raise StopTask(f"disk kam hai — free {hr(free)}, chahiye {hr(need)}")
-            self.used += int(size * 1.3)
-
-    async def release(self, size):
-        async with self._lock:
-            self.used = max(0, self.used - int(size * 1.3))
-
-
-async def send_by_file_id(acc: Client, dst, msg, mtype, mobj) -> bool:
-    fid = getattr(mobj, "file_id", None)
-    if not fid:
-        return False
-    kw = dict(chat_id=dst, caption=msg.caption or "",
-              caption_entities=msg.caption_entities or None)
-    for attempt in (1, 2):
-        try:
-            if mtype == "video":
-                await acc.send_video(**kw, video=fid,
-                                     duration=getattr(mobj, "duration", 0) or 0,
-                                     width=getattr(mobj, "width", 0) or 0,
-                                     height=getattr(mobj, "height", 0) or 0,
-                                     supports_streaming=True)
-            elif mtype == "document":
-                await acc.send_document(**kw, document=fid,
-                                        file_name=getattr(mobj, "file_name", None))
-            elif mtype == "photo":
-                await acc.send_photo(**kw, photo=fid)
-            elif mtype == "audio":
-                await acc.send_audio(**kw, audio=fid,
-                                     duration=getattr(mobj, "duration", 0) or 0,
-                                     performer=getattr(mobj, "performer", None),
-                                     title=getattr(mobj, "title", None))
-            elif mtype == "voice":
-                await acc.send_voice(**kw, voice=fid,
-                                     duration=getattr(mobj, "duration", 0) or 0)
-            elif mtype == "animation":
-                await acc.send_animation(**kw, animation=fid)
-            elif mtype == "sticker":
-                await acc.send_sticker(chat_id=dst, sticker=fid)
-            else:
-                await acc.send_document(**kw, document=fid)
-            return True
-        except FloodWait:
-            raise
-        except Exception as e:
-            name = type(e).__name__
-            if any(t in name or t in str(e) for t in WRITE_ERR):
-                raise
-            if attempt == 1 and ("Reference" in name or "REFERENCE" in str(e)):
-                try:
-                    fresh = await acc.get_messages(msg.chat.id, msg.id)
-                except Exception:
-                    return False
-                if not fresh:
-                    return False
-                mtype, mobj = get_media(fresh)
-                msg = fresh
-                fid = getattr(mobj, "file_id", None) if mobj else None
-                if not fid:
-                    return False
-                continue
-            return False
-    return False
-
-
-async def transfer(acc: Client, dst, msg, mtype, mobj, budget, cb=None) -> bool:
+async def transfer_one(acc: Client, dst, msg, mtype, mobj) -> tuple[bool, int]:
+    """Download → Upload → Delete local. Returns (success, bytes_used)."""
     size = getattr(mobj, "file_size", 0) or 0
-    await budget.claim(size)
-    tmp = tempfile.mkdtemp(prefix="cb_", dir=str(DATA))
+    
+    # disk guard
+    reserve = int(SETTINGS.get("disk_reserve_gb", 1)) * 1024**3
+    free = disk_free()
+    needed = int(size * 1.2) + reserve
+    if free < needed:
+        raise StopTask(f"disk kam hai — free {hr(free)}, chahiye {hr(needed)}")
+
+    tmp_dir = tempfile.mkdtemp(prefix="cb_", dir=str(DATA))
+    local_path = None
     try:
-        ext = {"video": ".mp4", "audio": ".mp3", "voice": ".ogg",
-               "animation": ".mp4", "photo": ".jpg", "sticker": ".webp"}.get(mtype, ".bin")
-        name = getattr(mobj, "file_name", None) or f"file_{msg.id}{ext}"
-        path = os.path.join(tmp, name)
-        got = await acc.download_media(msg, file_name=path)
+        ext = {
+            "video": ".mp4", "audio": ".mp3", "voice": ".ogg",
+            "animation": ".mp4", "photo": ".jpg", "sticker": ".webp",
+        }.get(mtype, ".bin")
+        fname = getattr(mobj, "file_name", None) or f"file_{msg.id}{ext}"
+        local_path = os.path.join(tmp_dir, fname)
+
+        # download
+        got = await acc.download_media(msg, file_name=local_path)
         if not got or not os.path.exists(got):
-            return False
-        kw = dict(chat_id=dst, caption=msg.caption or "",
-                  caption_entities=msg.caption_entities or None)
+            return False, 0
+
+        # upload
+        cap = msg.caption or ""
+        cap_ent = msg.caption_entities or None
+        kw = dict(chat_id=dst, caption=cap, caption_entities=cap_ent)
+
         if mtype == "video":
-            await acc.send_video(**kw, video=got,
-                                 duration=getattr(mobj, "duration", 0) or 0,
-                                 width=getattr(mobj, "width", 0) or 0,
-                                 height=getattr(mobj, "height", 0) or 0,
-                                 supports_streaming=True)
+            await acc.send_video(
+                **kw, video=got,
+                duration=getattr(mobj, "duration", 0) or 0,
+                width=getattr(mobj, "width", 0) or 0,
+                height=getattr(mobj, "height", 0) or 0,
+                supports_streaming=True,
+            )
+        elif mtype == "document":
+            await acc.send_document(
+                **kw, document=got,
+                file_name=getattr(mobj, "file_name", None),
+            )
         elif mtype == "photo":
             await acc.send_photo(**kw, photo=got)
         elif mtype == "audio":
-            await acc.send_audio(**kw, audio=got,
-                                 duration=getattr(mobj, "duration", 0) or 0)
+            await acc.send_audio(
+                **kw, audio=got,
+                duration=getattr(mobj, "duration", 0) or 0,
+            )
         elif mtype == "voice":
-            await acc.send_voice(**kw, voice=got,
-                                 duration=getattr(mobj, "duration", 0) or 0)
+            await acc.send_voice(
+                **kw, voice=got,
+                duration=getattr(mobj, "duration", 0) or 0,
+            )
         elif mtype == "animation":
             await acc.send_animation(**kw, animation=got)
         elif mtype == "sticker":
             await acc.send_sticker(chat_id=dst, sticker=got)
         else:
-            await acc.send_document(**kw, document=got, force_document=True)
-        return True
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)
-        await budget.release(size)
+            await acc.send_document(**kw, document=got)
 
+        return True, size
 
-async def copy_one(acc: Client, dst, msg, budget, st=None, counters=None) -> bool:
-    mtype, mobj = get_media(msg)
-    if st is not None:
-        rec = st["files"].setdefault(str(msg.id), {})
-        rec.update({"status": "inflight", "ts": time.time(),
-                    "name": getattr(mobj, "file_name", None) if mobj else None,
-                    "size": (getattr(mobj, "file_size", 0) or 0) if mobj else 0,
-                    "unique_id": (getattr(mobj, "file_unique_id", None)
-                                  or getattr(mobj, "file_id", None)) if mobj else None})
-        state_save(st, push=False)
-
-    if not mtype:                                    # text
-        for kw in (dict(entities=msg.entities or None), {}):
-            try:
-                await acc.send_message(dst, msg.text or "",
-                                       disable_web_page_preview=True, **kw)
-                if counters is not None:
-                    counters["server"] += 1
-                return True
-            except FloodWait:
-                raise
-            except Exception:
-                continue
-        return False
-
-    try:                                             # 1) server-side copy (0 data)
-        await acc.copy_message(chat_id=dst, from_chat_id=msg.chat.id, message_id=msg.id)
-        if counters is not None:
-            counters["server"] += 1
-        return True
     except FloodWait:
         raise
     except Exception as e:
         if any(t in type(e).__name__ or t in str(e) for t in WRITE_ERR):
             raise
-
-    try:                                             # 2) file_id (0 data)
-        if await send_by_file_id(acc, dst, msg, mtype, mobj):
-            if counters is not None:
-                counters["cache"] += 1
-            return True
-    except FloodWait:
-        raise
-    except Exception:
-        pass
-
-    try:                                             # 3) download + upload
-        if await transfer(acc, dst, msg, mtype, mobj, budget):
-            size = getattr(mobj, "file_size", 0) or 0
-            if counters is not None:
-                counters["transfer"] += 1
-                counters["bytes"] += size * 2
-            return True
-    except FloodWait:
-        raise
-    return False
-
-
-# ══════════════════════════════════════════════════════════════
-# SCAN
-# ══════════════════════════════════════════════════════════════
-async def newest_id(acc, src) -> int:
-    async for m in acc.get_chat_history(src, limit=1):
-        return getattr(m, "id", 0) or 0
-    return 0
-
-
-async def fetch_ids(acc, src, ids):
-    for _ in range(3):
+        log.warning(f"transfer_one fail mid={msg.id}: {type(e).__name__}: {e}")
+        return False, 0
+    finally:
+        # DELETE local immediately after upload — stream-delete
         try:
-            res = await acc.get_messages(src, ids)
-            return [m for m in (res if isinstance(res, list) else [res])
-                    if m and not getattr(m, "empty", False)]
-        except FloodWait as e:
-            await asyncio.sleep(int(e.value) + 2)
-        except Exception as e:
-            log.warning(f"fetch fail: {e}")
-            return []
-    return []
-
-
-async def scan_media(acc, src, want=0, only=None, on_progress=None):
-    """want>0 -> start se itni media (id probing) | want==0 -> saari media."""
-    if want:
-        probe, picked, empty, calls = 1, [], 0, 0
-        top = await newest_id(acc, src)
-        while len(picked) < want:
-            if top and probe > top + 100:
-                break
-            msgs = await fetch_ids(acc, src, list(range(probe, probe + 100)))
-            calls += 1
-            if not msgs:
-                empty += 1
-                if empty >= 8:
-                    break
-            else:
-                empty = 0
-            for m in sorted(msgs, key=lambda x: x.id):
-                t, _ = get_media(m)
-                if not t or (only and t != only):
-                    continue
-                picked.append(m)
-                if len(picked) >= want:
-                    break
-            probe += 100
-            if on_progress and calls % 5 == 0:
-                on_progress(len(picked))
-            await asyncio.sleep(0.25)
-        if len(picked) < want:                       # sparse channel fallback
-            extra = await scan_all(acc, src, only)
-            have = {m.id for m in picked}
-            for m in extra:
-                if m.id not in have:
-                    picked.append(m)
-                if len(picked) >= want:
-                    break
-        picked.sort(key=lambda m: m.id)
-        return picked[:want]
-
-    return await scan_all(acc, src, only)
-
-
-async def scan_all(acc, src, only=None):
-    found = []
-    async for m in acc.get_chat_history(src):
-        if not m or getattr(m, "empty", False):
-            continue
-        t, _ = get_media(m)
-        if not t or (only and t != only):
-            continue
-        found.append(m)
-    found.sort(key=lambda m: m.id)
-    return found
-
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        except Exception:
+            pass
 
 # ══════════════════════════════════════════════════════════════
-# TASK MANAGER
+# TASK RUNNER
 # ══════════════════════════════════════════════════════════════
 TASKS: dict[int, dict] = {}
 COUNTER = {"n": 0}
-GLOBAL_SEM = asyncio.Semaphore(6)
+GLOBAL_SEM: asyncio.Semaphore  # initialized in main()
 TASKS_FILE = DATA / "tasks.json"
-
 
 def tasks_save():
     try:
         out = []
         for t in TASKS.values():
-            out.append({k: t[k] for k in
-                        ("id", "src", "src_title", "dsts", "want", "only", "parallel",
-                         "batch", "status", "done", "total", "failed", "bytes",
-                         "modes", "created", "elapsed")})
-        TASKS_FILE.write_text(json.dumps(out, ensure_ascii=False, indent=1))
+            out.append({k: t[k] for k in (
+                "id", "src", "src_title", "dst", "dst_title",
+                "want", "status", "done", "total", "failed",
+                "bytes", "created", "elapsed",
+            ) if k in t})
+        TASKS_FILE.write_text(json.dumps(out, indent=1))
     except Exception:
         pass
-
 
 def tasks_load():
     if not TASKS_FILE.exists():
         return
     try:
         for t in json.loads(TASKS_FILE.read_text()):
-            t["status"] = "stopped" if t.get("status") in ("running", "paused") else t.get("status")
+            if t.get("status") in ("running", "paused"):
+                t["status"] = "stopped"
             t.setdefault("runner", None)
             TASKS[t["id"]] = t
         if TASKS:
@@ -589,753 +375,692 @@ def tasks_load():
     except Exception:
         pass
 
-
-async def resolve_targets(acc, text):
-    out = []
-    for part in [p.strip() for p in (text or "").split(",") if p.strip()]:
-        if part.lower() in SAVED:
-            out.append(("me", "Saved Messages"))
-        elif part.lstrip("-").isdigit():
-            cid = int(part)
-            try:
-                ch = await acc.get_chat(cid)
-                t = getattr(ch, "title", None) or getattr(ch, "first_name", None)
-            except Exception:
-                t = None
-            out.append((cid, t))
-        else:
-            ch = await acc.get_chat(part)
-            out.append((ch.id, getattr(ch, "title", None) or getattr(ch, "first_name", None)))
-    if not out:
-        raise ValueError("koi target nahi mila")
-    return out
-
-
-async def verify_inflight(acc, dst, st):
-    inflight = [k for k, v in st["files"].items() if v.get("status") == "inflight"]
-    if not inflight:
-        return
-    log.info(f"verifying {len(inflight)} inflight files against target")
-    seen = set()
-    try:
-        async for m in acc.get_chat_history(dst, limit=300):
-            t, o = get_media(m)
-            if o is not None:
-                u = getattr(o, "file_unique_id", None) or getattr(o, "file_id", None)
-                if u:
-                    seen.add(u)
-    except Exception:
-        for k in inflight:
-            st["files"][k]["status"] = "pending"
-        state_save(st, push=False)
-        return
-    for k in inflight:
-        u = st["files"][k].get("unique_id")
-        st["files"][k]["status"] = "done" if (u and u in seen) else "pending"
-    state_save(st, push=False)
-
-
-def task_text(t) -> str:
-    sm = {"done": t.get("done", 0), "pending": max(0, t.get("total", 0) - t.get("done", 0))}
-    total = t.get("total") or 1
-    bar = pbar(t.get("done", 0), total)
-    md = t.get("modes", {}) or {}
-    icon = {"running": "⚡", "paused": "⏸", "done": "✅", "cancelled": "❌",
-            "stopped": "⏹", "queued": "⏳", "error": "⚠️"}.get(
-        (t.get("status") or "").split(":")[0], "🔄")
-    txt = (f"{icon} <b>Task #{t['id']}</b> — {esc(t.get('status'))}\n\n"
-           f"📤 {esc(t.get('src_title') or t['src'])}\n"
-           f"📥 {esc(', '.join(lbl for _, lbl in (t.get('dsts') or [])) or '?')}\n\n"
-           f"[{bar}] {t.get('done', 0)}/{t.get('total', 0)} files"
-           + (f" | ❌ {t.get('failed', 0)}" if t.get("failed") else "") + "\n"
-           f"⚙️ server: {md.get('server', 0)} | file_id(0-data): {md.get('cache', 0)} | "
-           f"download+upload: {md.get('transfer', 0)}\n"
-           f"📶 data: {hr(t.get('bytes', 0))} | ⏱ {t.get('elapsed', 0)/60:.1f} min")
-    if t.get("note"):
-        txt += f"\n\n⚠️ {esc(t['note'])[:400]}"
-    return txt
-
-
-def task_kb(t):
-    tid = t["id"]
-    st = t.get("status")
-    rows = []
-    if st in ("running",):
-        rows.append([("⏸ Pause", f"t_pause_{tid}"), ("❌ Cancel", f"t_cancel_{tid}")])
-    elif st in ("paused", "stopped", "cancelled", "error") or (st or "").startswith("stopped"):
-        rows.append([("▶️ Resume", f"t_resume_{tid}"), ("🗑 Delete", f"t_del_{tid}")])
-    if t.get("failed"):
-        rows.append([("🔁 Retry failed", f"t_retry_{tid}")])
-    rows.append([("🔄 Refresh", f"t_view_{tid}"), ("◀ Tasks", "menu_tasks")])
-    return kb(*rows)
-
-
 async def run_task(tid: int):
     t = TASKS.get(tid)
     if not t:
         return
     t["status"] = "running"
-    t["note"] = ""
+    t["runner"] = asyncio.current_task()
     tasks_save()
-    t0 = time.time()
-    par = max(1, int(t.get("parallel", 3)))
-    batch = max(1, int(t.get("batch", 5)))
-    max_bytes = int(float(SETTINGS.get("max_data_gb", 0)) * 1024 ** 3) if SETTINGS.get("max_data_gb") else 0
-    reserve = int(float(SETTINGS.get("disk_reserve_gb", 2)) * 1024 ** 3)
+
+    src = t["src"]
+    dst = t["dst"]
+    want = t.get("want", 0)
+    st = state_load(src, dst)
+    start = time.time()
 
     try:
         acc = await acc_client()
-    except Exception as e:
-        t["status"] = "error"
-        t["note"] = f"user account connect nahi hua: {e}"
-        return
 
-    st = None
-    try:
-        # ── scan ──
-        t["status"] = "scanning"
-        only = t.get("only")
-        media = await scan_media(acc, t["src"], int(t.get("want") or 0), only)
-        if not media:
-            t["status"] = "done"
-            t["note"] = "koi file nahi mili (filter galat ya chat khali)"
-            return
-        total = len(media)
-
-        # multi-target: state har target ke liye alag
-        for dst, dtitle in t["dsts"]:
-            stt = state_load(t["src"], dst)
-            await verify_inflight(acc, dst, stt)
-            todo = [m for m in media if stt["files"].get(str(m.id), {}).get("status") != "done"]
-
-            t["status"] = "running"
-            t["total"] = total
-            t["done"] = total - len(todo)
-            t["dst_current"] = label(dst)
-            tasks_save()
-
-            budget = Budget(max_bytes, reserve)
-            groups = [todo[i:i + batch] for i in range(0, len(todo), batch)]
-
-            for gi, group in enumerate(groups, 1):
-                if t.get("cancel"):
-                    t["status"] = "cancelled"
-                    raise StopTask("cancel kiya gaya")
-                while t.get("paused"):
-                    if t.get("cancel"):
-                        t["status"] = "cancelled"
-                        raise StopTask("cancel kiya gaya")
-                    t["status"] = "paused"
-                    await asyncio.sleep(1)
-                if t.get("cancel"):
-                    t["status"] = "cancelled"
-                    raise StopTask("cancel kiya gaya")
-                if t.get("status") != "cancelled":
-                    t["status"] = "running"
-
-                sem = asyncio.Semaphore(par)
-
-                async def worker(m):
-                    async with sem:
-                        async with GLOBAL_SEM:
-                            while t.get("paused"):
-                                if t.get("cancel"):
-                                    raise StopTask("cancel kiya gaya")
-                                await asyncio.sleep(1)
-                            if t.get("cancel"):
-                                raise StopTask("cancel kiya gaya")
-                            mtype, mobj = get_media(m)
-                            size = getattr(mobj, "file_size", 0) or 0
-                            t["current"] = f"#{m.id} {mtype}"
-                            ok = False
-                            f0 = time.time()
-                            try:
-                                ok = await asyncio.wait_for(
-                                    copy_one(acc, dst, m, budget, stt, t["modes"]), timeout=1800)
-                            except StopTask:
-                                raise
-                            except FloodWait as e:
-                                await asyncio.sleep(int(e.value) + 3)
-                            except asyncio.TimeoutError:
-                                t["note"] = f"#{m.id} timeout (30 min) — skip"
-                            except Exception as e:
-                                if any(x in type(e).__name__ or x in str(e) for x in WRITE_ERR):
-                                    raise StopTask(
-                                        "target me likhne ki permission nahi — us channel me "
-                                        "apna account admin banao (Post Messages ON)")
-                                log.warning(f"copy fail #{m.id}: {type(e).__name__}: {e}")
-
-                            mark(stt, m.id, ok, name=getattr(mobj, "file_name", None), size=size,
-                                 unique_id=(getattr(mobj, "file_unique_id", None)
-                                            or getattr(mobj, "file_id", None)) if mobj else None)
-                            state_save(stt, push=False)
-                            if ok:
-                                t["done"] = t.get("done", 0) + 1
-                                t["bytes"] = t.get("bytes", 0) + size * 2 if t["modes"]["transfer"] else t["bytes"]
-                                t["speed"] = (size * 2) / max(0.1, time.time() - f0) / 1024 ** 2
-                                t["last_ok"] = f"#{m.id} {mtype} {hr(size)} {time.time()-f0:.0f}s"
-                            else:
-                                t["failed"] = t.get("failed", 0) + 1
-                            tasks_save()
-                            if SETTINGS.get("delay"):
-                                await asyncio.sleep(float(SETTINGS["delay"]))
-
-                if par == 1:
-                    for m in group:
-                        await worker(m)
-                else:
-                    await asyncio.gather(*(worker(m) for m in group))
-
-                # batch barrier + retry
-                again = [m for m in group
-                         if stt["files"].get(str(m.id), {}).get("status") != "done"]
-                if again and not t.get("cancel"):
-                    for m in again:
-                        try:
-                            async with GLOBAL_SEM:
-                                ok = await asyncio.wait_for(
-                                    copy_one(acc, dst, m, budget, stt, t["modes"]), timeout=1800)
-                            mark(stt, m.id, ok)
-                            if ok:
-                                t["done"] = t.get("done", 0) + 1
-                                t["failed"] = max(0, t.get("failed", 1) - 1)
-                        except Exception:
-                            pass
-
-                state_save(stt, push=True)
-                t["batch_no"] = f"{gi}/{len(groups)}"
-                tasks_save()
-
-        t["status"] = "done"
-        t["note"] = ""
-    except StopTask as e:
-        if t.get("status") != "cancelled":
-            t["status"] = "stopped"
-        t["note"] = str(e)
-    except asyncio.CancelledError:
-        t["status"] = "stopped"
-        t["note"] = "band kiya gaya"
-    except Exception as e:
-        log.exception("task crash")
-        t["status"] = "error"
-        t["note"] = f"{type(e).__name__}: {e}"
-    finally:
-        t["elapsed"] = t.get("elapsed", 0) + (time.time() - t0)
-        t["current"] = ""
+        # scan messages
+        found = []
+        async for m in acc.get_chat_history(src):
+            if not m or getattr(m, "empty", False):
+                continue
+            mtype, mobj = get_media(m)
+            if not mtype:
+                continue
+            found.append(m)
+            if want and len(found) >= want:
+                break
+        found.sort(key=lambda m: m.id)
+        t["total"] = len(found)
         tasks_save()
 
+        sem = asyncio.Semaphore(int(SETTINGS.get("parallel", 2)))
 
-def start_task(tid):
-    t = TASKS[tid]
+        async def copy_one(msg):
+            mid = str(msg.id)
+            rec = st["files"].get(mid, {})
+            if rec.get("status") == "done":
+                t["done"] = t.get("done", 0) + 1
+                return
+
+            if t.get("cancel") or t.get("paused"):
+                return
+
+            async with sem:
+                async with GLOBAL_SEM:
+                    if t.get("cancel"):
+                        return
+                    while t.get("paused"):
+                        await asyncio.sleep(1)
+                    if t.get("cancel"):
+                        return
+
+                    mtype, mobj = get_media(msg)
+                    if not mtype:
+                        return
+
+                    for attempt in range(3):
+                        try:
+                            ok, used = await transfer_one(acc, dst, msg, mtype, mobj)
+                            if ok:
+                                st["files"][mid] = {"status": "done", "ts": time.time()}
+                                t["done"] = t.get("done", 0) + 1
+                                t["bytes"] = t.get("bytes", 0) + used * 2
+                            else:
+                                st["files"][mid] = {"status": "failed"}
+                                t["failed"] = t.get("failed", 0) + 1
+                            state_save(st)
+                            break
+                        except FloodWait as e:
+                            wait = int(e.value) + 2
+                            log.info(f"FloodWait {wait}s")
+                            await asyncio.sleep(wait)
+                        except StopTask as e:
+                            t["status"] = f"stopped:{e}"
+                            t["note"] = str(e)
+                            tasks_save()
+                            return
+                        except Exception as e:
+                            if any(x in type(e).__name__ or x in str(e) for x in WRITE_ERR):
+                                t["status"] = f"error: write forbidden on dst"
+                                tasks_save()
+                                return
+                            if attempt == 2:
+                                st["files"][mid] = {"status": "failed"}
+                                t["failed"] = t.get("failed", 0) + 1
+                                state_save(st)
+                            await asyncio.sleep(2 ** attempt)
+
+                    t["elapsed"] = time.time() - start
+                    tasks_save()
+                    await asyncio.sleep(float(SETTINGS.get("delay", 0.3)))
+
+        # batch processing with periodic state flush
+        batch = int(SETTINGS.get("batch_size", 5))
+        for i in range(0, len(found), batch):
+            if t.get("cancel"):
+                break
+            chunk = found[i:i + batch]
+            await asyncio.gather(*[copy_one(m) for m in chunk])
+            state_save(st)
+            tasks_save()
+
+        if not t.get("cancel"):
+            t["status"] = "done"
+        tasks_save()
+
+    except asyncio.CancelledError:
+        t["status"] = "cancelled"
+        tasks_save()
+    except Exception as e:
+        log.error(f"task {tid} crashed: {e}", exc_info=True)
+        t["status"] = f"error: {e}"
+        tasks_save()
+
+def start_task(tid: int):
+    t = TASKS.get(tid)
+    if not t:
+        return
     if t.get("runner") and not t["runner"].done():
         return
-    t["cancel"] = False
-    t["paused"] = False
-    t["runner"] = asyncio.create_task(run_task(tid))
-
+    t["runner"] = asyncio.ensure_future(run_task(tid))
 
 # ══════════════════════════════════════════════════════════════
-# BOT UI
+# CONVERSATION STATE (per user)
 # ══════════════════════════════════════════════════════════════
-STATES: dict[int, dict] = {}
+CONV: dict[int, dict] = {}
 
+def conv_set(uid: int, **kw):
+    if uid not in CONV:
+        CONV[uid] = {}
+    CONV[uid].update(kw)
 
-def main_menu():
+def conv_get(uid: int) -> dict:
+    return CONV.get(uid, {})
+
+def conv_clear(uid: int):
+    CONV.pop(uid, None)
+
+# ══════════════════════════════════════════════════════════════
+# MAIN MENU
+# ══════════════════════════════════════════════════════════════
+MAIN_KB = kb(
+    [("➕ New Task", "menu_new"), ("📋 Tasks", "menu_tasks")],
+    [("📊 Progress", "menu_progress"), ("⚙️ Settings", "menu_settings")],
+    [("🩺 Diagnostics", "diag")],
+)
+
+def main_menu_text() -> str:
     running = sum(1 for t in TASKS.values() if t.get("status") == "running")
-    rows = [[("➕ New Task", "new"), ("📋 Tasks", "menu_tasks")],
-            [("📊 Progress", "menu_progress"), ("⚙️ Settings", "menu_settings")],
-            [("🩺 Test / Diagnostics", "diag")]]
-    head = f"🤖 <b>Copy Bot</b>\n\n" + (f"⚡ {running} task chal raha hai\n" if running else "")
-    return head, kb(*rows)
+    total_done = sum(t.get("done", 0) for t in TASKS.values())
+    return (
+        f"🤖 <b>Copy Bot</b> — online\n\n"
+        f"⚡ Running tasks: <b>{running}</b>\n"
+        f"✅ Total copied: <b>{total_done}</b>\n"
+        f"💾 Disk free: <b>{hr(disk_free())}</b>\n\n"
+        f"<i>Restricted channel bhi support karta hai — direct download+upload mode</i>"
+    )
 
-
-def guard(func):
-    @functools.wraps(func)
-    async def wrap(client, upd, *a, **kw):
-        u = getattr(upd, "from_user", None) or getattr(
-            getattr(upd, "message", None), "from_user", None)
-        uid = u.id if u else 0
-        iscb = hasattr(upd, "answer")
-        if not is_admin(uid):
-            if iscb:
-                try:
-                    await upd.answer(f"⛔ Admin nahi. Aapki ID: {uid}", show_alert=True)
-                except Exception:
-                    pass
-            else:
-                await upd.reply(f"⛔ Admin nahi. Aapki ID: <code>{uid}</code>",
-                                parse_mode=enums.ParseMode.HTML)
-            return
-        if iscb:
-            try:
-                await upd.answer()
-            except Exception:
-                pass
-        try:
-            return await func(client, upd, *a, **kw)
-        except FloodWait as e:
-            log.warning(f"floodwait {e.value}s")
-        except Exception as e:
-            log.exception(f"handler {func.__name__}")
-            txt = f"❌ <b>Error</b>\n<code>{esc(type(e).__name__)}: {esc(e)}</code>"
-            try:
-                if iscb and getattr(upd, "message", None):
-                    await safe_edit(upd.message, txt, kb([("◀ Menu", "menu")]))
-                elif hasattr(upd, "reply"):
-                    await upd.reply(txt, parse_mode=enums.ParseMode.HTML)
-            except Exception:
-                pass
-    return wrap
-
-
-@bot.on_message(filters.command(["start", "menu"]) & filters.private)
-@guard
-async def cmd_start(c, m):
-    STATES.pop(m.from_user.id, None)
-    head, markup = main_menu()
-    await m.reply(head + "\nNeeche se chuno 👇", reply_markup=markup,
-                  parse_mode=enums.ParseMode.HTML)
-
+@bot.on_message(filters.command("start") & filters.private)
+async def cmd_start(c: Client, m: Message):
+    if not is_admin(m.from_user.id):
+        return
+    conv_clear(m.from_user.id)
+    await m.reply_text(main_menu_text(), reply_markup=MAIN_KB,
+                       parse_mode=enums.ParseMode.HTML)
 
 @bot.on_callback_query(filters.regex("^menu$"))
-@guard
-async def cb_menu(c, q):
-    STATES.pop(q.from_user.id, None)
-    head, markup = main_menu()
-    await safe_edit(q.message, head + "\nNeeche se chuno 👇", markup)
-
-
-# ── NEW TASK ──
-@bot.on_callback_query(filters.regex("^new$"))
-@guard
-async def cb_new(c, q):
-    STATES[q.from_user.id] = {"step": "src", "d": {}}
-    await safe_edit(q.message,
-                    "➕ <b>New Task — Step 1/5</b>\n\n"
-                    "📤 <b>Source</b> bhejo — jahan se copy karna hai\n\n"
-                    "• ID: <code>-1001234567890</code>\n"
-                    "• ya <code>@username</code> / invite link\n\n"
-                    "<i>Source wale account se hi SESSION_STRING hai, warna access nahi hoga.</i>",
-                    kb([("◀ Cancel", "menu")]))
-
-
-@bot.on_message(filters.private & filters.text & ~filters.command(["start", "menu"]))
-@guard
-async def on_text(c, m):
-    uid = m.from_user.id
-    st = STATES.get(uid)
-    if not st:
-        head, markup = main_menu()
-        await m.reply(head + "\nNeeche se chuno 👇", reply_markup=markup,
-                      parse_mode=enums.ParseMode.HTML)
+async def cb_menu(c: Client, q: CallbackQuery):
+    if not is_admin(q.from_user.id):
         return
-    txt = (m.text or "").strip()
-    step, d = st["step"], st["d"]
-    acc = await acc_client()
+    conv_clear(q.from_user.id)
+    await safe_edit(q.message, main_menu_text(), MAIN_KB)
 
-    if step == "src":
-        try:
-            if txt.lstrip("-").isdigit():
-                src = int(txt)
-                try:
-                    ch = await acc.get_chat(src)
-                    title = getattr(ch, "title", None)
-                except Exception:
-                    title = None
-            else:
-                ch = await acc.get_chat(txt)
-                src, title = ch.id, getattr(ch, "title", None)
-        except Exception as e:
-            await m.reply(f"❌ Source nahi mila: <code>{esc(type(e).__name__)}: {esc(e)}</code>\n"
-                          "Pehle us account se channel join karo.",
-                          parse_mode=enums.ParseMode.HTML)
-            return
-        d["src"], d["src_title"] = src, title
-        st["step"] = "dst"
-        await m.reply(f"✅ Source: <b>{esc(title or src)}</b>\n<code>{src}</code>\n\n"
-                      "📥 <b>Target</b> bhejo (jahan file jaayegi)\n\n"
-                      "• ID / @username / link\n"
-                      "• <code>me</code> = Saved Messages\n"
-                      "• ek se zyada: comma se — <code>me, -1001234..., @mychannel</code>",
-                      reply_markup=kb([("◀ Cancel", "menu")]),
-                      parse_mode=enums.ParseMode.HTML)
+# ══════════════════════════════════════════════════════════════
+# NEW TASK FLOW
+# ══════════════════════════════════════════════════════════════
+@bot.on_callback_query(filters.regex("^menu_new$"))
+async def cb_new(c: Client, q: CallbackQuery):
+    if not is_admin(q.from_user.id):
         return
+    conv_set(q.from_user.id, step="await_src")
+    await safe_edit(
+        q.message,
+        "📤 <b>Source</b> — source channel/group ka ID ya username do\n\n"
+        "<code>-100xxxxxxxxxx</code> ya <code>@username</code>",
+        kb([("❌ Cancel", "menu")]),
+    )
 
-    if step == "dst":
-        try:
-            targets = await resolve_targets(acc, txt)
-        except Exception as e:
-            await m.reply(f"❌ Target nahi mila: <code>{esc(type(e).__name__)}: {esc(e)}</code>")
-            return
-        d["dsts"] = targets
-        warn = ""
-        for dst, _ in targets:
-            if is_saved(dst):
-                warn += "\n✅ Saved Messages"
-                continue
-            try:
-                me = await acc.get_me()
-                mem = await acc.get_chat_member(dst, me.id)
-                stt = str(getattr(mem, "status", "")).split(".")[-1].lower()
-                warn += (f"\n{'✅' if stt in ('administrator','owner','creator') else '🚫'} "
-                         f"{esc(label(dst))}: {stt}")
-            except Exception as e:
-                warn += f"\n⚠️ {esc(label(dst))}: check fail ({type(e).__name__})"
-        st["step"] = "count"
-        await m.reply(f"✅ Target set{warn}\n\n"
-                      "🔢 <b>Kitni files?</b>\n\n"
-                      "• number: <code>50</code>\n"
-                      "• <code>all</code> = saari files (start se)\n\n"
-                      "<i>Resume apne aap hota hai — jo pehle ho chuki hain skip hongi.</i>",
-                      reply_markup=kb([("◀ Cancel", "menu")]),
-                      parse_mode=enums.ParseMode.HTML)
-        return
-
-    if step == "count":
-        if txt.lower() in ("all", "a", "0", "*"):
-            d["want"] = 0
-        elif txt.isdigit():
-            d["want"] = int(txt)
-        else:
-            await m.reply("❌ number ya `all` likho")
-            return
-        st["step"] = "filter"
-        await m.reply("🗂 <b>Kaunsi files?</b>",
-                      reply_markup=kb([("Sab (video/pdf/photo/audio)", "f_all")],
-                                      [("Sirf video", "f_video")],
-                                      [("Sirf documents (pdf/txt)", "f_document")]))
-        return
-
-    if step == "parallel":
-        d["parallel"] = max(1, min(8, int(txt))) if txt.isdigit() else 3
-        st["step"] = "confirm"
-        await show_confirm(m, d)
-        return
-
-
-@bot.on_callback_query(filters.regex("^f_(all|video|document)$"))
-@guard
-async def cb_filter(c, q):
-    uid = q.from_user.id
-    st = STATES.get(uid)
-    if not st:
-        await safe_edit(q.message, "Session expire — /start dobara", kb([("◀ Menu", "menu")]))
-        return
-    val = q.data.split("_")[1]
-    st["d"]["only"] = None if val == "all" else val
-    st["step"] = "parallel"
-    await safe_edit(q.message,
-                    f"⚙️ <b>Parallel files?</b> (ek saath kitni)\n\n"
-                    f"1 = strict order\n3 = fast (recommended)\n5 = sabse fast\n\n"
-                    f"Abhi default: <b>{SETTINGS['parallel']}</b>",
-                    kb([("1 (order)", "p_1"), ("3 (fast)", "p_3"), ("5", "p_5")],
-                       [("◀ Cancel", "menu")]))
-
-
-@bot.on_callback_query(filters.regex("^p_(\\d)$"))
-@guard
-async def cb_parallel(c, q):
-    uid = q.from_user.id
-    st = STATES.get(uid)
-    if not st:
-        return
-    st["d"]["parallel"] = int(q.matches[0].group(1))
-    st["step"] = "confirm"
-    await show_confirm(q, st["d"])
-
-
-async def show_confirm(q, d):
-    src, src_title = d["src"], d.get("src_title")
-    want = d.get("want", 0)
-    only = d.get("only")
-    tl = "\n".join(f"  • {esc(t or label(x))}" for x, t in d["dsts"])
-    txt = (f"🧾 <b>Confirm Task</b>\n\n"
-           f"📤 Source: <b>{esc(src_title or src)}</b>\n     <code>{src}</code>\n"
-           f"📥 Target ({len(d['dsts'])}):\n{tl}\n\n"
-           f"🔢 Files: <b>{'saari' if not want else want}</b>"
-           f" | filter: {only or 'sab'}\n"
-           f"⚙️ parallel: {d.get('parallel', 3)} | batch: {SETTINGS['batch_size']}\n\n"
-           f"▶️ Start dabao (resume apne aap).")
-    await safe_edit(q.message, txt, kb([("▶️ Start", "do_start")], [("◀ Cancel", "menu")]))
-
-
-@bot.on_callback_query(filters.regex("^do_start$"))
-@guard
-async def cb_do_start(c, q):
-    uid = q.from_user.id
-    st = STATES.pop(uid, None)
-    if not st:
-        await safe_edit(q.message, "Session expire — /start dobara", kb([("◀ Menu", "menu")]))
-        return
-    d = st["d"]
-    running = [t for t in TASKS.values() if t.get("status") in ("running", "scanning", "paused")]
-    if len(running) >= int(SETTINGS.get("max_tasks", 3)):
-        await safe_edit(q.message,
-                        f"⚠️ Already {len(running)} tasks chal rahe hain (max {SETTINGS['max_tasks']}).\n"
-                        "Pehle koi pause/cancel karo.", kb([("◀ Tasks", "menu_tasks")]))
-        return
-    COUNTER["n"] += 1
-    tid = COUNTER["n"]
-    TASKS[tid] = {
-        "id": tid, "src": d["src"], "src_title": d.get("src_title"),
-        "dsts": d["dsts"], "want": d.get("want", 0), "only": d.get("only"),
-        "parallel": d.get("parallel", 3), "batch": SETTINGS["batch_size"],
-        "status": "queued", "done": 0, "total": 0, "failed": 0, "bytes": 0,
-        "modes": {"server": 0, "cache": 0, "transfer": 0},
-        "created": time.time(), "elapsed": 0, "note": "", "runner": None,
-    }
-    start_task(tid)
-    tasks_save()
-    await safe_edit(q.message, f"🚀 <b>Task #{tid} shuru!</b>\n\n"
-                               "📋 Tasks se live dekho, 📊 Progress se overall.",
-                    kb([(f"👁 Task #{tid}", f"t_view_{tid}")], [("◀ Menu", "menu")]))
-
-
-# ── TASKS ──
 @bot.on_callback_query(filters.regex("^menu_tasks$"))
-@guard
-async def cb_tasks(c, q):
+async def cb_tasks(c: Client, q: CallbackQuery):
+    if not is_admin(q.from_user.id):
+        return
     if not TASKS:
         await safe_edit(q.message, "📋 Koi task nahi. ➕ New Task se banao.",
-                        kb([("➕ New Task", "new")], [("◀ Menu", "menu")]))
+                        kb([("➕ New Task", "menu_new"), ("◀ Menu", "menu")]))
         return
-    rows = []
+    lines = ["📋 <b>Tasks</b>\n"]
     for t in sorted(TASKS.values(), key=lambda x: -x["id"])[:10]:
-        icon = {"running": "⚡", "paused": "⏸", "done": "✅", "cancelled": "❌",
-                "stopped": "⏹", "error": "⚠️", "scanning": "🔎", "queued": "⏳"}.get(
+        icon = {"running":"⚡","paused":"⏸","done":"✅","cancelled":"❌",
+                "stopped":"⏹","error":"⚠️"}.get(
             (t.get("status") or "").split(":")[0], "🔄")
-        rows.append([(f"{icon} #{t['id']} {t.get('done',0)}/{t.get('total',0)} — {t.get('status')}",
-                      f"t_view_{t['id']}")])
-    rows.append([("◀ Menu", "menu")])
-    await safe_edit(q.message, "📋 <b>Tasks</b>\n\nKisi par tap karo:", kb(*rows))
+        lines.append(
+            f"{icon} <b>#{t['id']}</b> — {esc(t.get('src_title', t['src']))} → "
+            f"{esc(t.get('dst_title', t.get('dst','?')))}\n"
+            f"   {t.get('done',0)}/{t.get('total',0)} | {t.get('status','?')}"
+        )
+    rows = [[("🔍 Detail", f"t_detail_{t['id']}")] for t in
+            sorted(TASKS.values(), key=lambda x: -x["id"])[:5]]
+    rows.append([("🔄 Refresh", "menu_tasks"), ("◀ Menu", "menu")])
+    await safe_edit(q.message, "\n".join(lines), kb(*rows))
 
-
-@bot.on_callback_query(filters.regex(r"^t_view_(\d+)$"))
-@guard
-async def cb_tview(c, q):
+@bot.on_callback_query(filters.regex(r"^t_detail_(\d+)$"))
+async def cb_task_detail(c: Client, q: CallbackQuery):
+    if not is_admin(q.from_user.id):
+        return
     tid = int(q.matches[0].group(1))
     t = TASKS.get(tid)
     if not t:
-        await safe_edit(q.message, "Task nahi mila", kb([("◀ Tasks", "menu_tasks")]))
+        await q.answer("Task nahi mila", show_alert=True)
         return
-    extra = ""
-    if t.get("current"):
-        extra = f"\n\n📄 ab: <code>{esc(t['current'])}</code>"
-    if t.get("speed"):
-        extra += f"\n🚀 last speed: {t['speed']:.1f} MB/s"
-    if t.get("batch_no"):
-        extra += f"\n📦 batch: {t['batch_no']}"
-    await safe_edit(q.message, task_text(t) + extra, task_kb(t))
+    await safe_edit(q.message, _task_text(t), _task_kb(t))
 
+def _task_text(t) -> str:
+    total = t.get("total") or 1
+    done = t.get("done", 0)
+    bar = pbar(done, total)
+    pct = done * 100 // total if total else 0
+    elapsed = t.get("elapsed", 0)
+    speed = ""
+    if elapsed > 0 and t.get("bytes", 0):
+        bps = t["bytes"] / elapsed
+        speed = f" | {hr(bps)}/s"
+    icon = {"running":"⚡","paused":"⏸","done":"✅","cancelled":"❌",
+            "stopped":"⏹","error":"⚠️"}.get(
+        (t.get("status") or "").split(":")[0], "🔄")
+    txt = (
+        f"{icon} <b>Task #{t['id']}</b>\n\n"
+        f"📤 {esc(t.get('src_title', t.get('src','?')))}\n"
+        f"📥 {esc(t.get('dst_title', t.get('dst','?')))}\n\n"
+        f"[{bar}] {done}/{t.get('total',0)} ({pct}%)\n"
+        f"✅ Done: {done} | ❌ Failed: {t.get('failed',0)}\n"
+        f"📶 Data: {hr(t.get('bytes',0))}{speed}\n"
+        f"⏱ {elapsed/60:.1f} min\n"
+        f"Status: <b>{esc(t.get('status','?'))}</b>"
+    )
+    if t.get("note"):
+        txt += f"\n\n⚠️ {esc(t['note'])[:300]}"
+    return txt
+
+def _task_kb(t):
+    tid = t["id"]
+    st = t.get("status", "")
+    rows = []
+    if st == "running":
+        rows.append([("⏸ Pause", f"t_pause_{tid}"), ("❌ Cancel", f"t_cancel_{tid}")])
+    elif st in ("paused", "stopped", "cancelled", "error") or st.startswith("stopped"):
+        rows.append([("▶️ Resume", f"t_resume_{tid}"), ("🗑 Delete", f"t_del_{tid}")])
+    elif st == "done":
+        rows.append([("🗑 Delete", f"t_del_{tid}")])
+    if t.get("failed"):
+        rows.append([("🔁 Retry failed", f"t_retry_{tid}")])
+    rows.append([("🔄 Refresh", f"t_detail_{tid}"), ("◀ Tasks", "menu_tasks")])
+    return kb(*rows)
 
 @bot.on_callback_query(filters.regex(r"^t_(pause|resume|cancel|del|retry)_(\d+)$"))
-@guard
-async def cb_taction(c, q):
-    act, tid = q.matches[0].group(1), int(q.matches[0].group(2))
+async def cb_taction(c: Client, q: CallbackQuery):
+    if not is_admin(q.from_user.id):
+        return
+    act = q.matches[0].group(1)
+    tid = int(q.matches[0].group(2))
     t = TASKS.get(tid)
     if not t:
+        await q.answer("Task nahi mila", show_alert=True)
         return
+
     if act == "pause":
         t["paused"] = True
         t["status"] = "paused"
     elif act == "resume":
-        if t.get("runner") and not t["runner"].done():
-            t["paused"] = False
-            t["status"] = "running"
-        else:
+        t["paused"] = False
+        t["cancel"] = False
+        if not t.get("runner") or t["runner"].done():
             start_task(tid)
+        else:
+            t["status"] = "running"
     elif act == "cancel":
         t["cancel"] = True
         t["status"] = "cancelled"
+        if t.get("runner") and not t["runner"].done():
+            t["runner"].cancel()
     elif act == "del":
         t["cancel"] = True
+        if t.get("runner") and not t["runner"].done():
+            t["runner"].cancel()
         TASKS.pop(tid, None)
         tasks_save()
         await cb_tasks(c, q)
         return
     elif act == "retry":
-        st = state_load(t["src"], t["dsts"][0][0])
+        st = state_load(t["src"], t["dst"])
         n = 0
-        for k, v in st["files"].items():
+        for v in st["files"].values():
             if v.get("status") == "failed":
                 v["status"] = "pending"
                 n += 1
         state_save(st)
         t["failed"] = 0
+        t["cancel"] = False
         start_task(tid)
-        await q.answer(f"{n} files retry queue me", show_alert=True)
+        await q.answer(f"{n} files retry queue mein", show_alert=True)
+
     tasks_save()
-    await safe_edit(q.message, task_text(TASKS.get(tid) or t),
-                    task_kb(TASKS.get(tid) or t))
+    await safe_edit(q.message, _task_text(TASKS.get(tid) or t),
+                    _task_kb(TASKS.get(tid) or t))
 
-
-# ── PROGRESS ──
+# ══════════════════════════════════════════════════════════════
+# PROGRESS
+# ══════════════════════════════════════════════════════════════
 @bot.on_callback_query(filters.regex("^menu_progress$"))
-@guard
-async def cb_progress(c, q):
-    await safe_edit(q.message, build_progress(), kb([("🔄 Refresh", "menu_progress")],
-                                                    [("◀ Menu", "menu")]))
-
-
-def build_progress() -> str:
+async def cb_progress(c: Client, q: CallbackQuery):
+    if not is_admin(q.from_user.id):
+        return
     if not TASKS:
-        return "📊 Koi task nahi. ➕ New Task se banao."
-    lines = ["📊 <b>Progress</b>\n"]
+        await safe_edit(q.message, "📊 Koi task nahi.",
+                        kb([("◀ Menu", "menu")]))
+        return
+    lines = ["📊 <b>Live Progress</b>\n"]
     for t in sorted(TASKS.values(), key=lambda x: -x["id"])[:8]:
         total = t.get("total") or 0
-        bar = pbar(t.get("done", 0), total)
-        pct = (t.get("done", 0) * 100 // total) if total else 0
+        done = t.get("done", 0)
+        bar = pbar(done, total)
+        pct = done * 100 // total if total else 0
+        elapsed = t.get("elapsed", 0)
+        eta = ""
+        if done > 0 and total > done and elapsed > 0:
+            rate = done / elapsed
+            remaining = (total - done) / rate
+            eta = f" | ETA {remaining/60:.0f}m"
         lines.append(
-            f"<b>#{t['id']}</b> [{bar}] {pct}%  {t.get('status')}\n"
-            f"    ✅ {t.get('done', 0)} | ⏳ {max(0, total - t.get('done', 0))} | "
-            f"❌ {t.get('failed', 0)} | 📶 {hr(t.get('bytes', 0))} | ⏱ {t.get('elapsed',0)/60:.1f}m")
-    pend = 0
-    for f in DATA.glob("state_*.json"):
-        try:
-            pend += summary(json.loads(f.read_text()))["pending"]
-        except Exception:
-            pass
-    lines.append(f"\n⏳ total baaki (save hua state): <b>{pend}</b>")
-    lines.append("↪️ Resume: Tasks → ▶️ Resume, ya naya task same source/target par — "
-                 "jo ho chuki hain skip hongi.")
-    return "\n".join(lines)
+            f"<b>#{t['id']}</b> [{bar}] {pct}%  {t.get('status','')}\n"
+            f"   ✅{done} ❌{t.get('failed',0)} 📶{hr(t.get('bytes',0))}{eta}"
+        )
+    await safe_edit(q.message, "\n".join(lines),
+                    kb([("🔄 Refresh", "menu_progress")], [("◀ Menu", "menu")]))
 
-
-# ── SETTINGS ──
+# ══════════════════════════════════════════════════════════════
+# SETTINGS
+# ══════════════════════════════════════════════════════════════
 @bot.on_callback_query(filters.regex("^menu_settings$"))
-@guard
-async def cb_settings(c, q):
-    txt = (f"⚙️ <b>Settings</b>\n\n"
-           f"⚡ parallel (per task): <b>{SETTINGS['parallel']}</b>\n"
-           f"📦 batch size: <b>{SETTINGS['batch_size']}</b>\n"
-           f"🧵 max tasks saath: <b>{SETTINGS['max_tasks']}</b>\n"
-           f"🌐 global parallel: <b>{SETTINGS['global_concurrency']}</b>\n"
-           f"📶 data limit (download mode): "
-           f"<b>{SETTINGS['max_data_gb'] or 'no limit'}</b>"
-           f"{' GB' if SETTINGS['max_data_gb'] else ''}\n"
-           f"💾 disk reserve: <b>{SETTINGS['disk_reserve_gb']} GB</b> "
-           f"(free: {hr(disk_free())})\n"
-           f"☁️ firebase: <b>{'ON' if SETTINGS['firebase_url'] else 'OFF'}</b>")
+async def cb_settings(c: Client, q: CallbackQuery):
+    if not is_admin(q.from_user.id):
+        return
+    txt = (
+        f"⚙️ <b>Settings</b>\n\n"
+        f"⚡ parallel (per task): <b>{SETTINGS['parallel']}</b>\n"
+        f"📦 batch size: <b>{SETTINGS['batch_size']}</b>\n"
+        f"🧵 max tasks: <b>{SETTINGS['max_tasks']}</b>\n"
+        f"🌐 global parallel: <b>{SETTINGS['global_concurrency']}</b>\n"
+        f"💾 disk reserve: <b>{SETTINGS['disk_reserve_gb']}GB</b> "
+        f"(free now: {hr(disk_free())})\n"
+        f"⏳ delay between files: <b>{SETTINGS['delay']}s</b>\n\n"
+        f"<i>Stream-delete ON — upload ke baad local file turant delete</i>"
+    )
     await safe_edit(q.message, txt, kb(
-        [("⚡ 1", "s_par_1"), ("⚡ 3", "s_par_3"), ("⚡ 5", "s_par_5")],
-        [("📦 batch 3", "s_bat_3"), ("📦 5", "s_bat_5"), ("📦 10", "s_bat_10")],
-        [("📶 limit: 0", "s_lim_0"), ("📶 20GB", "s_lim_20"), ("📶 100GB", "s_lim_100")],
-        [("◀ Menu", "menu")]))
+        [("⚡ par=1", "s_par_1"), ("⚡ par=2", "s_par_2"), ("⚡ par=3", "s_par_3")],
+        [("📦 batch=3", "s_bat_3"), ("📦 batch=5", "s_bat_5"), ("📦 batch=10", "s_bat_10")],
+        [("🧵 tasks=2", "s_tsk_2"), ("🧵 tasks=3", "s_tsk_3")],
+        [("⏳ delay=0.2", "s_dly_2"), ("⏳ delay=0.5", "s_dly_5"), ("⏳ delay=1", "s_dly_10")],
+        [("◀ Menu", "menu")],
+    ))
 
-
-@bot.on_callback_query(filters.regex(r"^s_(par|bat|lim)_(\d+)$"))
-@guard
-async def cb_setting(c, q):
-    kind, val = q.matches[0].group(1), int(q.matches[0].group(2))
+@bot.on_callback_query(filters.regex(r"^s_(par|bat|tsk|dly)_(\d+)$"))
+async def cb_setting(c: Client, q: CallbackQuery):
+    if not is_admin(q.from_user.id):
+        return
+    kind = q.matches[0].group(1)
+    val = int(q.matches[0].group(2))
     if kind == "par":
         SETTINGS["parallel"] = val
     elif kind == "bat":
         SETTINGS["batch_size"] = val
-    else:
-        SETTINGS["max_data_gb"] = val
+    elif kind == "tsk":
+        SETTINGS["max_tasks"] = val
+    elif kind == "dly":
+        SETTINGS["delay"] = val / 10.0
     save_settings()
     await cb_settings(c, q)
 
-
-# ── DIAGNOSTICS ──
+# ══════════════════════════════════════════════════════════════
+# DIAGNOSTICS
+# ══════════════════════════════════════════════════════════════
 @bot.on_callback_query(filters.regex("^diag$"))
-@guard
-async def cb_diag(c, q):
+async def cb_diag(c: Client, q: CallbackQuery):
+    if not is_admin(q.from_user.id):
+        return
     await safe_edit(q.message, "🩺 Test chal raha hai...", kb([("◀ Menu", "menu")]))
-    lines, ok = [], True
+    lines = []
+    ok_all = True
 
     def add(s, name, detail=""):
-        nonlocal ok
-        lines.append(f"{s} <b>{name}</b>" + (f"\n     <code>{esc(detail)[:250]}</code>" if detail else ""))
+        nonlocal ok_all
+        lines.append(f"{s} <b>{esc(name)}</b>"
+                     + (f"\n   <code>{esc(detail)[:200]}</code>" if detail else ""))
         if s.startswith("❌"):
-            ok = False
+            ok_all = False
 
     miss = [k for k, v in [("API_ID", API_ID), ("API_HASH", API_HASH),
-                           ("BOT_TOKEN", BOT_TOKEN), ("SESSION_STRING", SESSION_STRING)] if not v]
-    add("✅" if not miss else "❌", "Env", "sab set" if not miss else f"missing: {miss}")
-    add("ℹ️", "Admins", str(ADMIN_IDS) or "khali (sab allowed)")
+                            ("BOT_TOKEN", BOT_TOKEN), ("SESSION_STRING", SESSION_STRING)] if not v]
+    add("✅" if not miss else "❌", "Env vars",
+        "sab theek" if not miss else f"missing: {', '.join(miss)}")
+    add("ℹ️", "Admin IDs", str(ADMIN_IDS) or "empty = sab allowed")
 
     try:
         me = await bot.get_me()
-        add("✅", "Bot", f"@{me.username}")
+        add("✅", "Bot", f"@{me.username} (id {me.id})")
     except Exception as e:
-        add("❌", "Bot", f"{type(e).__name__}: {e}")
+        add("❌", "Bot", str(e))
 
     try:
         acc = await acc_client()
         me = await acc.get_me()
         add("✅", "User account", f"{me.first_name} (id {me.id})")
-        n = 0
-        async for d in acc.get_dialogs(limit=100):
-            if getattr(d, "chat", None):
-                n += 1
-        add("✅", "Chats", f"{n} mila (Get ID kaam karega)")
         try:
-            t = await acc.send_message("me", "🩺 test")
-            await t.delete()
-            add("✅", "Saved Messages", "write OK")
+            tm = await acc.send_message("me", "🩺 test — delete kar do")
+            await tm.delete()
+            add("✅", "Saved Messages write", "OK")
         except Exception as e:
-            add("⚠️", "Saved Messages", f"{type(e).__name__}: {e}")
+            add("⚠️", "Saved Messages write", str(e))
     except Exception as e:
-        add("❌", "User account", f"{type(e).__name__}: {e} — SESSION_STRING check karo")
+        add("❌", "User account", f"{e} — SESSION_STRING check karo")
 
-    add("✅" if disk_free() > 2 * 1024 ** 3 else "⚠️", "Disk", hr(disk_free()))
-    add("ℹ️", "Engine", f"parallel={SETTINGS['parallel']} batch={SETTINGS['batch_size']} "
-                        f"tasks≤{SETTINGS['max_tasks']}")
+    free = disk_free()
+    add("✅" if free > 2 * 1024**3 else "⚠️", "Disk free", hr(free))
+    add("ℹ️", "Settings",
+        f"parallel={SETTINGS['parallel']} batch={SETTINGS['batch_size']} "
+        f"max_tasks={SETTINGS['max_tasks']} delay={SETTINGS['delay']}s")
+    add("ℹ️", "Stream-delete", "ON — upload ke baad turant local delete")
 
-    await safe_edit(q.message, "🩺 <b>Diagnostics</b>\n\n" + "\n".join(lines)
-                    + "\n\n" + ("✅ sab theek" if ok else "❌ kuch fix karna hai"),
-                    kb([("🔄 Test", "diag")], [("◀ Menu", "menu")]))
-
+    await safe_edit(
+        q.message,
+        "🩺 <b>Diagnostics</b>\n\n" + "\n".join(lines)
+        + "\n\n" + ("✅ Sab theek — ready to go!" if ok_all else "❌ Kuch fix karo"),
+        kb([("🔄 Retest", "diag")], [("◀ Menu", "menu")]),
+    )
 
 # ══════════════════════════════════════════════════════════════
-# KEEP-ALIVE (Render) + MAIN
+# TEXT MESSAGE HANDLER — conversation flow
+# ══════════════════════════════════════════════════════════════
+@bot.on_message(filters.text & filters.private & ~filters.command(["start"]))
+async def on_text(c: Client, m: Message):
+    uid = m.from_user.id
+    if not is_admin(uid):
+        return
+
+    state = conv_get(uid)
+    step = state.get("step")
+
+    if not step:
+        await m.reply_text(
+            "Use /start to open the menu.",
+            parse_mode=enums.ParseMode.HTML,
+        )
+        return
+
+    text = (m.text or "").strip()
+
+    # ── STEP 1: source ──────────────────────────────────────
+    if step == "await_src":
+        try:
+            acc = await acc_client()
+            src_id = int(text) if text.lstrip("-").isdigit() else text
+            chat = await acc.get_chat(src_id)
+            title = getattr(chat, "title", None) or getattr(chat, "first_name", None) or str(src_id)
+            conv_set(uid, step="await_dst", src=chat.id, src_title=title)
+            await m.reply_text(
+                f"✅ Source: <b>{esc(title)}</b> (<code>{chat.id}</code>)\n\n"
+                f"📥 <b>Target</b> — destination channel/group ka ID do\n"
+                f"<i>Woh channel jahan files copy hongi</i>",
+                parse_mode=enums.ParseMode.HTML,
+                reply_markup=kb([("❌ Cancel", "menu")]),
+            )
+        except Exception as e:
+            await m.reply_text(
+                f"❌ Source nahi mila: <code>{esc(e)}</code>\n\n"
+                f"Dobara try karo ya channel ID check karo.",
+                parse_mode=enums.ParseMode.HTML,
+                reply_markup=kb([("❌ Cancel", "menu")]),
+            )
+
+    # ── STEP 2: destination ─────────────────────────────────
+    elif step == "await_dst":
+        try:
+            acc = await acc_client()
+            dst_id = int(text) if text.lstrip("-").isdigit() else text
+            chat = await acc.get_chat(dst_id)
+            title = getattr(chat, "title", None) or getattr(chat, "first_name", None) or str(dst_id)
+            conv_set(uid, step="await_count", dst=chat.id, dst_title=title)
+            await m.reply_text(
+                f"✅ Target: <b>{esc(title)}</b> (<code>{chat.id}</code>)\n\n"
+                f"🔢 <b>Kitni files?</b>\n"
+                f"• Number dalo (e.g. <code>50</code>) — pehli N files\n"
+                f"• <code>all</code> — sab files (1000+ bhi)",
+                parse_mode=enums.ParseMode.HTML,
+                reply_markup=kb([("All files", "conv_all"), ("❌ Cancel", "menu")]),
+            )
+        except Exception as e:
+            await m.reply_text(
+                f"❌ Target nahi mila: <code>{esc(e)}</code>",
+                parse_mode=enums.ParseMode.HTML,
+                reply_markup=kb([("❌ Cancel", "menu")]),
+            )
+
+    # ── STEP 3: count ───────────────────────────────────────
+    elif step == "await_count":
+        want = 0
+        if text.lower() != "all":
+            try:
+                want = int(text)
+                if want <= 0:
+                    raise ValueError
+            except ValueError:
+                await m.reply_text(
+                    "❌ Number ya 'all' dalo",
+                    reply_markup=kb([("All files", "conv_all"), ("❌ Cancel", "menu")]),
+                )
+                return
+        await _confirm_task(c, m, uid, want)
+
+    else:
+        conv_clear(uid)
+        await m.reply_text("Use /start", parse_mode=enums.ParseMode.HTML)
+
+async def _confirm_task(c, m_or_q, uid, want):
+    state = conv_get(uid)
+    src = state["src"]
+    dst = state["dst"]
+    src_title = state.get("src_title", str(src))
+    dst_title = state.get("dst_title", str(dst))
+    count_txt = str(want) if want else "All"
+
+    running = sum(1 for t in TASKS.values() if t.get("status") == "running")
+    max_t = int(SETTINGS.get("max_tasks", 3))
+    warn = f"\n\n⚠️ <i>{running} task(s) already running</i>" if running >= max_t else ""
+
+    txt = (
+        f"📋 <b>Confirm Task</b>{warn}\n\n"
+        f"📤 Source: <b>{esc(src_title)}</b>\n"
+        f"📥 Target: <b>{esc(dst_title)}</b>\n"
+        f"🔢 Files: <b>{count_txt}</b>\n"
+        f"⚡ Parallel: <b>{SETTINGS['parallel']}</b>\n"
+        f"💾 Mode: <b>stream-delete</b> (upload ke baad local delete)\n\n"
+        f"Start karo?"
+    )
+
+    confirm_kb = kb(
+        [("✅ Start", "conv_start"), ("❌ Cancel", "menu")],
+    )
+    conv_set(uid, step="confirm", want=want)
+
+    if isinstance(m_or_q, Message):
+        await m_or_q.reply_text(txt, parse_mode=enums.ParseMode.HTML, reply_markup=confirm_kb)
+    else:
+        await safe_edit(m_or_q.message, txt, confirm_kb)
+
+@bot.on_callback_query(filters.regex("^conv_all$"))
+async def cb_conv_all(c: Client, q: CallbackQuery):
+    uid = q.from_user.id
+    if not is_admin(uid):
+        return
+    state = conv_get(uid)
+    if state.get("step") != "await_count":
+        return
+    conv_set(uid, want=0)
+    await _confirm_task(c, q, uid, 0)
+
+@bot.on_callback_query(filters.regex("^conv_start$"))
+async def cb_conv_start(c: Client, q: CallbackQuery):
+    uid = q.from_user.id
+    if not is_admin(uid):
+        return
+    state = conv_get(uid)
+    if state.get("step") != "confirm":
+        return
+
+    src = state["src"]
+    dst = state["dst"]
+    want = state.get("want", 0)
+
+    COUNTER["n"] += 1
+    tid = COUNTER["n"]
+    TASKS[tid] = {
+        "id": tid,
+        "src": src,
+        "src_title": state.get("src_title", str(src)),
+        "dst": dst,
+        "dst_title": state.get("dst_title", str(dst)),
+        "want": want,
+        "status": "queued",
+        "done": 0,
+        "total": 0,
+        "failed": 0,
+        "bytes": 0,
+        "created": time.time(),
+        "elapsed": 0,
+        "runner": None,
+        "note": "",
+    }
+    tasks_save()
+    conv_clear(uid)
+
+    start_task(tid)
+
+    await safe_edit(
+        q.message,
+        f"⚡ <b>Task #{tid} started!</b>\n\n"
+        f"📤 {esc(state.get('src_title', str(src)))}\n"
+        f"📥 {esc(state.get('dst_title', str(dst)))}\n"
+        f"🔢 {want or 'All files'}\n\n"
+        f"<i>Scanning aur copying shuru...</i>",
+        kb([("📊 Progress", "menu_progress"), ("📋 Tasks", "menu_tasks"), ("◀ Menu", "menu")]),
+    )
+
+# ══════════════════════════════════════════════════════════════
+# KEEP-ALIVE (Render / Codespaces)
 # ══════════════════════════════════════════════════════════════
 async def keep_alive():
     try:
         from aiohttp import web
         app = web.Application()
         app.router.add_get("/", lambda r: web.Response(
-            text=f"Copy Bot running | tasks={len(TASKS)}"))
+            text=f"CopyBot OK | tasks={len(TASKS)} | disk={hr(disk_free())}"))
         runner = web.AppRunner(app)
         await runner.setup()
         port = int(os.environ.get("PORT", "8080"))
         await web.TCPSite(runner, "0.0.0.0", port).start()
-        log.info(f"keep-alive on 0.0.0.0:{port}")
+        log.info(f"keep-alive on :{port}")
     except Exception as e:
         log.warning(f"keep-alive skip: {e}")
 
-
+# ══════════════════════════════════════════════════════════════
+# MAIN
+# ══════════════════════════════════════════════════════════════
 async def main():
+    global GLOBAL_SEM
+
     load_settings()
-    GLOBAL_SEM = asyncio.Semaphore(int(SETTINGS.get("global_concurrency", 6)))
-    await keep_alive()
+    GLOBAL_SEM = asyncio.Semaphore(int(SETTINGS.get("global_concurrency", 4)))
 
     if not all([API_ID, API_HASH, BOT_TOKEN, SESSION_STRING]):
-        log.error("ENV missing: API_ID / API_HASH / BOT_TOKEN / SESSION_STRING")
-        log.error("GitHub → Settings → Codespaces → Secrets me daalo, phir restart karo.")
+        missing = [k for k, v in (
+            ("API_ID", API_ID), ("API_HASH", API_HASH),
+            ("BOT_TOKEN", BOT_TOKEN), ("SESSION_STRING", SESSION_STRING),
+        ) if not v]
+        log.error("❌ Missing credentials: " + ", ".join(missing))
+        log.error("bot.py ke upar HARD_* variables mein ya .env mein bhar do")
         return
 
+    await keep_alive()
     tasks_load()
+
+    # start user client early
     try:
-        acc = await acc_client()
-        me = await acc.get_me()
-        log.info(f"user: {me.first_name} ({me.id})")
+        await acc_client()
     except Exception as e:
         log.error(f"user account fail: {e}")
 
     await bot.start()
     me = await bot.get_me()
-    log.info(f"bot @{me.username} ready | admins={ADMIN_IDS}")
+    log.info(f"✅ Bot @{me.username} ready | admins={ADMIN_IDS or 'all'}")
+
+    # notify admins
     for uid in ADMIN_IDS[:3]:
         try:
-            await bot.send_message(uid, "🤖 <b>Copy Bot online</b>\n\n/start dabao",
-                                   parse_mode=enums.ParseMode.HTML)
+            await bot.send_message(
+                uid,
+                "🤖 <b>Copy Bot online!</b>\n\n"
+                "/start dabao — menu aayega\n"
+                f"💾 Disk: {hr(disk_free())} | Stream-delete: ON",
+                parse_mode=enums.ParseMode.HTML,
+            )
         except Exception:
             pass
+
     await idle()
     await bot.stop()
-
 
 if __name__ == "__main__":
     asyncio.run(main())
