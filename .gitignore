@@ -1,5 +1,12 @@
+# Local credentials — never commit these.
+.env
+.env.*
+!.env.example
+
+# Runtime state and Python artifacts.
+.venv/
+__pycache__/
+*.py[cod]
 data/*.log
 data/state_*.json
 data/tasks.json
-__pycache__/
-*.pyc

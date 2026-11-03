@@ -30,7 +30,7 @@ try:
         Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
     )
 except ImportError:
-    print("pip install pyrofork aiohttp")
+    print("Install dependencies with: python -m pip install -r requirements.txt")
     sys.exit(1)
 
 # ══════════════════════════════════════════════════════════════
@@ -56,17 +56,12 @@ _load_dotenv()
 # ══════════════════════════════════════════════════════════════
 # CONFIG — yahan apni values bhar do
 # ══════════════════════════════════════════════════════════════
-HARD_API_ID       = 36349735       # e.g. 12345678
-HARD_API_HASH     = "373122633b75d964ca4a168c7b79e683"       # "abcdef1234567890abcdef1234567890"
-HARD_BOT_TOKEN    = "9117075404:AAHcuv5NdbiXDry0pvUflFl67Y0h6wffDXo"       # "123456789:AAxxxx"
-HARD_SESSION_STRING = "BQIqpycAu2ieCeU0pGV1tsfNvV636oWKCSU80g26idsK4q3Uwq1CycTsRc21AUHKgUfUdvQkpzYIvSELnOxTE10akDqM9oiWB486DK9zSYKGh1ncXJaIuvqdHbkKOdYBKUAah6WYSsRrazFhtj9fs4wyyHvZeY-1CFtpjwaboj8_2hBRawfWD3RzmoEAteahQnaDmKblZHXBWO_aRoOQVA590G6jBIiclkrPX6fiMKV5-3_ObK-fCiMYwol7meHff_BW51sWownkBr3JIgGRWTvdY_Z4E02oCn6tslxtp9cLhEaKOxrzn7i1O12dLkpzTCCrONugdeDlIb9_8yF_xVDjTI3GbAAAAAGspGeKAA"     # "BQxxxx..."  (Pyrogram session)
-HARD_ADMIN_IDS    = ""       # "7191422858" ya "123456789,987654321"
-
-API_ID   = int(os.environ.get("API_ID", "0") or 0) or int(HARD_API_ID or 0)
-API_HASH = (os.environ.get("API_HASH", "") or HARD_API_HASH or "").strip()
-BOT_TOKEN = (os.environ.get("BOT_TOKEN", "") or HARD_BOT_TOKEN or "").strip()
-SESSION_STRING = (os.environ.get("SESSION_STRING", "") or HARD_SESSION_STRING or "").strip()
-_ids = os.environ.get("ADMIN_IDS", "") or HARD_ADMIN_IDS or ""
+# Credentials are loaded only from environment variables or the gitignored .env file.
+API_ID = int(os.environ.get("API_ID", "0") or 0)
+API_HASH = os.environ.get("API_HASH", "").strip()
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+SESSION_STRING = os.environ.get("SESSION_STRING", "").strip()
+_ids = os.environ.get("ADMIN_IDS", "")
 ADMIN_IDS = [int(x) for x in _ids.replace(" ", "").split(",") if x.lstrip("-").isdigit()]
 
 DATA = Path(__file__).resolve().parent / "data"
@@ -142,7 +137,7 @@ def get_media(m):
     return None, None
 
 def is_admin(uid: int) -> bool:
-    return not ADMIN_IDS or uid in ADMIN_IDS
+    return bool(ADMIN_IDS) and uid in ADMIN_IDS
 
 def kb(*rows):
     return InlineKeyboardMarkup(
@@ -999,23 +994,6 @@ async def cb_conv_start(c: Client, q: CallbackQuery):
     )
 
 # ══════════════════════════════════════════════════════════════
-# KEEP-ALIVE (Render / Codespaces)
-# ══════════════════════════════════════════════════════════════
-async def keep_alive():
-    try:
-        from aiohttp import web
-        app = web.Application()
-        app.router.add_get("/", lambda r: web.Response(
-            text=f"CopyBot OK | tasks={len(TASKS)} | disk={hr(disk_free())}"))
-        runner = web.AppRunner(app)
-        await runner.setup()
-        port = int(os.environ.get("PORT", "8080"))
-        await web.TCPSite(runner, "0.0.0.0", port).start()
-        log.info(f"keep-alive on :{port}")
-    except Exception as e:
-        log.warning(f"keep-alive skip: {e}")
-
-# ══════════════════════════════════════════════════════════════
 # MAIN
 # ══════════════════════════════════════════════════════════════
 async def main():
@@ -1024,16 +1002,16 @@ async def main():
     load_settings()
     GLOBAL_SEM = asyncio.Semaphore(int(SETTINGS.get("global_concurrency", 4)))
 
-    if not all([API_ID, API_HASH, BOT_TOKEN, SESSION_STRING]):
+    if not all([API_ID, API_HASH, BOT_TOKEN, SESSION_STRING, ADMIN_IDS]):
         missing = [k for k, v in (
             ("API_ID", API_ID), ("API_HASH", API_HASH),
             ("BOT_TOKEN", BOT_TOKEN), ("SESSION_STRING", SESSION_STRING),
+            ("ADMIN_IDS", ADMIN_IDS),
         ) if not v]
         log.error("❌ Missing credentials: " + ", ".join(missing))
-        log.error("bot.py ke upar HARD_* variables mein ya .env mein bhar do")
+        log.error("Run `bash run.sh` to configure credentials in the private .env file.")
         return
 
-    await keep_alive()
     tasks_load()
 
     # start user client early
