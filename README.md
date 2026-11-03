@@ -1,141 +1,35 @@
-# Copy Bot — GitHub Codespaces par, poora control Telegram se
+# Telegram Copy Bot — Codespaces terminal setup
 
-Is folder ki **saari files GitHub par upload** karni hain. Uske baad sirf **bot se** kaam hoga —
-terminal ki zarurat nahi (terminal hai bhi, par optional).
+> **Note:** This project is a Telegram media-copy bot; it does not automate Instagram.
 
-```
-github_bot/
-├── bot.py                       ← poora bot (engine + UI)
-├── requirements.txt
-├── selftest_bot.py              ← 31 tests (optional)
-├── .devcontainer/
-│   ├── devcontainer.json        ← Codespace banate hi sab auto
-│   ├── start.sh                 ← install + bot start
-│   └── resume.sh                ← bot ko background me chalata hai
-└── data/                        ← state/progress yahan save hota hai
-```
+## Run it in GitHub Codespaces
 
----
+1. Open the repository in a Codespace and open **Terminal → New Terminal**.
+2. Run:
+   ```bash
+   bash run.sh
+   ```
+3. On first run, the terminal asks, in order, for Telegram **API ID**, **API hash**, phone number, login code, and (if enabled) the Telegram 2FA password.
+4. It then asks for a **new BotFather bot token** and an admin Telegram user ID. By default, the Telegram account used for login is the admin.
+5. The bot starts in that terminal. Keep the terminal/Codespace open while using it. Stop it with `Ctrl+C`.
 
-## STEP 1 — GitHub par repo banao (phone/browser se bhi ho jayega)
+The wizard saves credentials in the private, gitignored `.env` file with owner-only file permissions. Do not upload `.env`, paste session strings into chat, or commit credentials. To change credentials, remove `.env` and run `bash run.sh` again.
 
-1. github.com → **New repository** → naam: `copy-bot` → **Private** → Create
-2. **Add file → Upload files** → is folder ki saari files drag-drop karo
-   (`.devcontainer` folder ke saath — folder banake andar 3 files daal do)
-3. **Commit changes**
+The second run reuses `.env` and starts the bot without asking for the login code again. The Codespace filesystem keeps `.env` while the Codespace exists, but this is not a permanent backup; deleting the Codespace deletes its local files.
 
-## STEP 2 — Secrets daalo (bas 1 baar)
+## Telegram prerequisites
 
-GitHub → **Settings → Codespaces → Secrets → New secret** — ye 5 add karo:
+- Create a bot with [@BotFather](https://t.me/BotFather) and use its token when prompted.
+- Get an API ID and API hash from [my.telegram.org](https://my.telegram.org).
+- The logged-in Telegram user must be able to read the source chat and post to the destination.
+- Use a private GitHub repository. Codespaces Secrets are optional for this terminal-wizard flow; credentials are stored in the Codespace's ignored `.env` file.
 
-| Secret | Kahan se |
-|---|---|
-| `API_ID` | my.telegram.org |
-| `API_HASH` | my.telegram.org |
-| `BOT_TOKEN` | @BotFather |
-| `SESSION_STRING` | aapke paas pehle se hai (`C:\Users\kumar\.rcf\config.json` me, ya Render env) |
-| `ADMIN_IDS` | aapki Telegram user id (bot bata dega) |
+## Important limitations
 
-**Naam bilkul same rakhna** (capital letters).
+- Codespaces is a development environment, not guaranteed 24/7 hosting. It can stop after its idle timeout, and the bot stops with it. Free usage is limited by your GitHub account's monthly Codespaces allowance.
+- Current transfer mode downloads each file and uploads it to the destination, so it uses network data and temporary disk space. It does not currently implement the server-side or file-ID zero-download paths described in older documentation.
+- Completed file progress is saved locally under `data/`. A stopped task can be resumed manually from the bot's Tasks menu, but active transfers do not continue while the Codespace is stopped.
 
-## STEP 3 — Codespace kholo
+## Security warning for existing users
 
-Repo → **Code** (green button) → **Codespaces** → **Create codespace on main**
-
-- Pehli baar 2-3 min: deps install + bot khud start (`data/bot.log`)
-- Ready hone par **Telegram me bot ko `/start`** bhejo — bas ho gaya 🎉
-
-> Terminal ki zarurat nahi. Agar kabhi band ho jaye to: Codespace kholo →
-> terminal me ek line: `bash .devcontainer/resume.sh`
-> (ya Codespace band-khol do — `postStartCommand` khud chala deta hai)
-
-## STEP 4 — Codespace ko zyada der chalta rakho
-
-GitHub → **Settings → Codespaces → Default idle timeout → 240 minutes**
-(default 30 min me so jata hai). Band ho jaye to kaam **rukta nahi** — state save hai,
-wapas kholte hi Resume se wahin se chalta hai.
-
----
-
-## Bot me kya kya hai
-
-**Main menu**
-```
-➕ New Task      📋 Tasks
-📊 Progress      ⚙️ Settings
-🩺 Test / Diagnostics
-```
-
-### ➕ New Task (5 step)
-1. **Source** — `-1001234567890` ya `@username` / invite link
-2. **Target** — ID / username / `me` (Saved Messages) / **comma se kai**: `me, -1001234..., @mychannel`
-   - bot turant batata hai: ✅ admin hai / 🚫 nahi (file_id mode ke liye zaroori)
-3. **Kitni files** — `50` ya `all` (saari)
-4. **Filter** — sab (video/pdf/photo/audio) / sirf video / sirf documents
-5. **Parallel** — 1 (order) / 3 (fast) / 5
-→ Confirm → **▶️ Start**
-
-### 📋 Tasks (ek saath 2-3 tasks)
-- Har task ka apna progress, pause / resume / cancel / delete, retry failed
-- Max 3 tasks ek saath (Settings me badal sakte ho)
-- Global concurrency cap → FloodWait nahi lagta
-
-### 📊 Progress
-```
-#2 [██████░░░░░░░░] 42%  running
-    ✅ 21 | ⏳ 29 | ❌ 0 | 📶 3.9GB | ⏱ 12.4m
-#1 [██████████████] 100% done
-⏳ total baaki (saved state): 29
-```
-
-### ⚙️ Settings (button se, terminal ke bina)
-parallel (1/3/5) · batch size (3/5/10) · data limit (0 = no limit / 20GB / 100GB)
-
-### 🩺 Test / Diagnostics
-env, bot, user account, chats, Saved Messages, disk — sab check karke batata hai.
-
----
-
-## Copy kaise hoti hai (3 tarike, jo chale pehle)
-
-| # | Tarika | Data |
-|---|---|---|
-| 1 | `copy_message` (Telegram server-side) | **0** |
-| 2 | `file_id` re-send | **0** |
-| 3 | download → upload | 2× file size |
-
-Aapke channel ne 1 & 2 block kar diye (`ChatForwardsRestricted`) to 3 chalega —
-data lagega, isliye **Codespaces / cloud** par chalao (aapka PC/phone data 0).
-
-## Resume + no-duplicate (aapki demand)
-- Har file ka status: `pending / inflight / done / failed` → `data/state_*.json`
-- Beech me ruka → dobara chalao → **jahan se ruka wahin se**, jo ho chuki hain skip
-- Crash ke waqt jo file ja rahi thi → **target channel check** (`file_unique_id`) →
-  gayi to skip, nahi gayi to retry → **ek file 2 baar nahi jayegi**
-- **Batch of 5**: har 5 ke baad sab-done check → fail hui turant retry → phir agla 5
-
-## Data / storage
-- Ek file download → upload → **turant delete** (peak ~1 file, ya parallel × size)
-- Disk guard: jagah kam ho to naya download ruk jata hai (crash nahi)
-- Data limit guard: limit paar hone wali ho to task ruk jata hai (350 GB accident nahi)
-
-## Firebase (optional, abhi zarurat nahi)
-`data/settings.json` me:
-```json
-{ "firebase_url": "https://xxx-default-rtdb.firebaseio.com", "firebase_token": "..." }
-```
-Har batch ke baad progress cloud me bhi save → dusre device se resume.
-
-## Dikkat aaye to
-| Problem | Fix |
-|---|---|
-| `/start` par jawab nahi | `ADMIN_IDS` me aapki id hai? (bot error me id batata hai) |
-| "user account fail" | `SESSION_STRING` galat/purana — naya chahiye |
-| "target me likhne ki permission nahi" | us channel me **apna account** admin banao (Post Messages ON) |
-| bahut slow | Settings → parallel 5, aur Codespaces me TgCrypto already installed hai |
-| Codespace so gaya | wapas kholo → `bash .devcontainer/resume.sh` (state safe hai) |
-
-## Tests (optional)
-```bash
-python3 selftest_bot.py     # 31 checks — engine, resume, no-duplicate, guards, UI
-```
+An earlier version of this repository contained hardcoded Telegram credentials. Removing them from the latest files does **not** erase them from Git history. Revoke/regenerate the bot token in BotFather and terminate the exposed user session under Telegram **Settings → Devices** before using this version. Generate a fresh session with `bash run.sh`.
