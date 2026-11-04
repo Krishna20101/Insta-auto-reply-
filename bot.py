@@ -117,6 +117,7 @@ async def _login_user(api_id: int, api_hash: str, phone: str):
 
 
 async def _verify_user_session(value: dict):
+    """Check the saved user key without starting update-handler workers."""
     client = Client(
         "copybot_session_check",
         api_id=int(value["api_id"]),
@@ -126,34 +127,11 @@ async def _verify_user_session(value: dict):
         no_updates=True,
     )
     try:
-        await client.start()
+        await client.connect()
         return await client.get_me()
     finally:
         if client.is_connected:
-            try:
-                await client.stop()
-            except Exception:
-                pass
-
-
-async def _verify_bot_token(value: dict, token: str):
-    client = Client(
-        "copybot_token_check",
-        api_id=int(value["api_id"]),
-        api_hash=value["api_hash"],
-        bot_token=token,
-        in_memory=True,
-        no_updates=True,
-    )
-    try:
-        await client.start()
-        return await client.get_me()
-    finally:
-        if client.is_connected:
-            try:
-                await client.stop()
-            except Exception:
-                pass
+            await client.disconnect()
 
 
 async def _terminal_setup() -> dict:
@@ -190,16 +168,9 @@ async def _terminal_setup() -> dict:
         _save_credentials(value)
         print(f"\n✅ Naya Telegram session ban gaya: {user.first_name} (ID {user.id})")
 
-    while True:
-        token = getpass.getpass("BotFather bot token: ").strip()
-        if not token:
-            print("Bot token khaali nahi ho sakta.")
-            continue
-        try:
-            bot_user = await _verify_bot_token(value, token)
-            break
-        except Exception as exc:
-            print(f"❌ Bot token login fail ({type(exc).__name__}); BotFather se token check karke dobara do.")
+    token = getpass.getpass("BotFather bot token: ").strip()
+    if not token:
+        raise ValueError("Bot token khaali nahi ho sakta.")
 
     saved_admins = value.get("admin_ids") or [user.id]
     if isinstance(saved_admins, str):
@@ -218,7 +189,7 @@ async def _terminal_setup() -> dict:
         pass
     value["bot_token"] = token
     value["admin_ids"] = [int(x) for x in value["admin_ids"]]
-    print(f"✅ Bot token verified: @{bot_user.username or 'bot'}; starting now.\n")
+    print("✅ Setup complete; starting the bot now.\n")
     return value
 
 
@@ -561,22 +532,8 @@ async def run_task(tid: int):
     try:
         acc = await acc_client()
 
-        # scan messages
-        found = []
-        async for m in acc.get_chat_history(src):
-            if not m or getattr(m, "empty", False):
-                continue
-            mtype, mobj = get_media(m)
-            if not mtype:
-                continue
-            found.append(m)
-            if want and len(found) >= want:
-                break
-        found.sort(key=lambda m: m.id)
-        t["total"] = len(found)
-        tasks_save()
-
         sem = asyncio.Semaphore(int(SETTINGS.get("parallel", 2)))
+        batch = max(1, int(SETTINGS.get("batch_size", 5)))
 
         async def copy_one(msg):
             mid = str(msg.id)
@@ -637,17 +594,56 @@ async def run_task(tid: int):
                     tasks_save()
                     await asyncio.sleep(float(SETTINGS.get("delay", 0.3)))
 
-        # batch processing with periodic state flush
-        batch = int(SETTINGS.get("batch_size", 5))
-        for i in range(0, len(found), batch):
-            if t.get("cancel"):
-                break
-            chunk = found[i:i + batch]
-            await asyncio.gather(*[copy_one(m) for m in chunk])
-            state_save(st)
+        if want:
+            # A requested count is capped during scanning, so we can show an
+            # exact total before copying, as in the original behaviour.
+            found = []
+            t["scanning"] = True
+            async for m in acc.get_chat_history(src):
+                if not m or getattr(m, "empty", False):
+                    continue
+                if not get_media(m)[0]:
+                    continue
+                found.append(m)
+                if len(found) >= want:
+                    break
+            found.sort(key=lambda m: m.id)
+            t["total"] = len(found)
+            t["scanning"] = False
             tasks_save()
+            for i in range(0, len(found), batch):
+                if t.get("cancel"):
+                    break
+                await asyncio.gather(*(copy_one(m) for m in found[i:i + batch]))
+                state_save(st)
+                tasks_save()
+        else:
+            # For "all", do not wait minutes to scan the whole channel before
+            # sending anything. Stream media in Telegram's history order and
+            # update an approximate total as batches are discovered.
+            t["scanning"] = True
+            t["total"] = 0
+            chunk = []
+            async for m in acc.get_chat_history(src):
+                if t.get("cancel"):
+                    break
+                if not m or getattr(m, "empty", False) or not get_media(m)[0]:
+                    continue
+                t["total"] = t.get("total", 0) + 1
+                chunk.append(m)
+                if len(chunk) >= batch:
+                    await asyncio.gather(*(copy_one(item) for item in chunk))
+                    state_save(st)
+                    tasks_save()
+                    chunk.clear()
+            if chunk and not t.get("cancel"):
+                await asyncio.gather(*(copy_one(item) for item in chunk))
+                state_save(st)
+            t["scanning"] = False
+            if not t.get("cancel"):
+                tasks_save()
 
-        if not t.get("cancel"):
+        if not t.get("cancel") and not str(t.get("status", "")).startswith(("error", "stopped")):
             t["status"] = "done"
         tasks_save()
 
@@ -746,10 +742,12 @@ async def cb_tasks(c: Client, q: CallbackQuery):
         icon = {"running":"⚡","paused":"⏸","done":"✅","cancelled":"❌",
                 "stopped":"⏹","error":"⚠️"}.get(
             (t.get("status") or "").split(":")[0], "🔄")
+        total = t.get("total", 0)
+        total_text = f"~{total}" if t.get("scanning") else str(total)
         lines.append(
             f"{icon} <b>#{t['id']}</b> — {esc(t.get('src_title', t['src']))} → "
             f"{esc(t.get('dst_title', t.get('dst','?')))}\n"
-            f"   {t.get('done',0)}/{t.get('total',0)} | {t.get('status','?')}"
+            f"   {t.get('done',0)}/{total_text} | {t.get('status','?')}"
         )
     rows = [[("🔍 Detail", f"t_detail_{t['id']}")] for t in
             sorted(TASKS.values(), key=lambda x: -x["id"])[:5]]
@@ -768,10 +766,12 @@ async def cb_task_detail(c: Client, q: CallbackQuery):
     await safe_edit(q.message, _task_text(t), _task_kb(t))
 
 def _task_text(t) -> str:
-    total = t.get("total") or 1
+    total_count = t.get("total", 0)
+    total = total_count or 1
+    total_text = f"~{total_count}" if t.get("scanning") else str(total_count)
     done = t.get("done", 0)
     bar = pbar(done, total)
-    pct = done * 100 // total if total else 0
+    pct = done * 100 // total if total_count else 0
     elapsed = t.get("elapsed", 0)
     speed = ""
     if elapsed > 0 and t.get("bytes", 0):
@@ -784,7 +784,7 @@ def _task_text(t) -> str:
         f"{icon} <b>Task #{t['id']}</b>\n\n"
         f"📤 {esc(t.get('src_title', t.get('src','?')))}\n"
         f"📥 {esc(t.get('dst_title', t.get('dst','?')))}\n\n"
-        f"[{bar}] {done}/{t.get('total',0)} ({pct}%)\n"
+        f"[{bar}] {done}/{total_text} ({pct}%)\n"
         f"✅ Done: {done} | ❌ Failed: {t.get('failed',0)}\n"
         f"📶 Data: {hr(t.get('bytes',0))}{speed}\n"
         f"⏱ {elapsed/60:.1f} min\n"
@@ -875,16 +875,17 @@ async def cb_progress(c: Client, q: CallbackQuery):
     for t in sorted(TASKS.values(), key=lambda x: -x["id"])[:8]:
         total = t.get("total") or 0
         done = t.get("done", 0)
+        total_text = f"~{total}" if t.get("scanning") else str(total)
         bar = pbar(done, total)
         pct = done * 100 // total if total else 0
         elapsed = t.get("elapsed", 0)
         eta = ""
-        if done > 0 and total > done and elapsed > 0:
+        if not t.get("scanning") and done > 0 and total > done and elapsed > 0:
             rate = done / elapsed
             remaining = (total - done) / rate
             eta = f" | ETA {remaining/60:.0f}m"
         lines.append(
-            f"<b>#{t['id']}</b> [{bar}] {pct}%  {t.get('status','')}\n"
+            f"<b>#{t['id']}</b> [{bar}] {pct}% {done}/{total_text}  {t.get('status','')}\n"
             f"   ✅{done} ❌{t.get('failed',0)} 📶{hr(t.get('bytes',0))}{eta}"
         )
     await safe_edit(q.message, "\n".join(lines),
