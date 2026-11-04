@@ -48,7 +48,10 @@ def _load_dotenv():
                 continue
             k, v = line.split("=", 1)
             k, v = k.strip(), v.strip().strip('"').strip("'")
-            if k and not os.environ.get(k):
+            # The setup wizard writes the fresh login to the repo-root .env.
+            # Prefer it over older Codespaces Secrets, which may still hold a
+            # revoked SESSION_STRING; data/.env remains a fallback only.
+            if k and (name == ".env" or not os.environ.get(k)):
                 os.environ[k] = v
 
 _load_dotenv()
