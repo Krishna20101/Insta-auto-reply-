@@ -117,6 +117,7 @@ async def _login_user(api_id: int, api_hash: str, phone: str):
 
 
 async def _verify_user_session(value: dict):
+    """Check the saved user key without starting update-handler workers."""
     client = Client(
         "copybot_session_check",
         api_id=int(value["api_id"]),
@@ -126,34 +127,11 @@ async def _verify_user_session(value: dict):
         no_updates=True,
     )
     try:
-        await client.start()
+        await client.connect()
         return await client.get_me()
     finally:
         if client.is_connected:
-            try:
-                await client.stop()
-            except Exception:
-                pass
-
-
-async def _verify_bot_token(value: dict, token: str):
-    client = Client(
-        "copybot_token_check",
-        api_id=int(value["api_id"]),
-        api_hash=value["api_hash"],
-        bot_token=token,
-        in_memory=True,
-        no_updates=True,
-    )
-    try:
-        await client.start()
-        return await client.get_me()
-    finally:
-        if client.is_connected:
-            try:
-                await client.stop()
-            except Exception:
-                pass
+            await client.disconnect()
 
 
 async def _terminal_setup() -> dict:
@@ -190,16 +168,9 @@ async def _terminal_setup() -> dict:
         _save_credentials(value)
         print(f"\n✅ Naya Telegram session ban gaya: {user.first_name} (ID {user.id})")
 
-    while True:
-        token = getpass.getpass("BotFather bot token: ").strip()
-        if not token:
-            print("Bot token khaali nahi ho sakta.")
-            continue
-        try:
-            bot_user = await _verify_bot_token(value, token)
-            break
-        except Exception as exc:
-            print(f"❌ Bot token login fail ({type(exc).__name__}); BotFather se token check karke dobara do.")
+    token = getpass.getpass("BotFather bot token: ").strip()
+    if not token:
+        raise ValueError("Bot token khaali nahi ho sakta.")
 
     saved_admins = value.get("admin_ids") or [user.id]
     if isinstance(saved_admins, str):
@@ -218,7 +189,7 @@ async def _terminal_setup() -> dict:
         pass
     value["bot_token"] = token
     value["admin_ids"] = [int(x) for x in value["admin_ids"]]
-    print(f"✅ Bot token verified: @{bot_user.username or 'bot'}; starting now.\n")
+    print("✅ Setup complete; starting the bot now.\n")
     return value
 
 
