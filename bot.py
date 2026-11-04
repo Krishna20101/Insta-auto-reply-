@@ -1,16 +1,14 @@
 
-"""
-╔══════════════════════════════════════════════════════════════════════════╗
-║  COPY BOT v2 — GitHub Codespaces / Render ready                         ║
-║  Stream-delete mode: upload hote hi local file delete                   ║
-║  Restricted channel support: seedha download+upload                     ║
-╚══════════════════════════════════════════════════════════════════════════╝
+"""Telegram media-copy bot.
 
-ENV — .env file ya seedha neeche HARD_* variables mein bhar do:
-    API_ID, API_HASH, BOT_TOKEN, SESSION_STRING, ADMIN_IDS
+Install requirements, then run ``python3 bot.py`` in a terminal. First run
+asks for Telegram API ID/hash, phone, login code/optional 2FA, bot token, and
+admin ID. The user session and settings are saved privately outside the repo;
+the bot token is entered each time and is never written to disk.
 """
 
 import asyncio
+import getpass
 import html as htmlmod
 import json
 import logging
@@ -34,41 +32,214 @@ except ImportError:
     sys.exit(1)
 
 # ══════════════════════════════════════════════════════════════
-# .env loader
+# PRIVATE SETUP — saved outside the repository
 # ══════════════════════════════════════════════════════════════
-def _load_dotenv():
-    here = Path(__file__).resolve().parent
-    for name in (".env", "data/.env"):
-        f = here / name
-        if not f.exists():
-            continue
-        for line in f.read_text().splitlines():
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            k, v = line.split("=", 1)
-            k, v = k.strip(), v.strip().strip('"').strip("'")
-            # The setup wizard writes the fresh login to the repo-root .env.
-            # Prefer it over older Codespaces Secrets, which may still hold a
-            # revoked SESSION_STRING; data/.env remains a fallback only.
-            if k and (name == ".env" or not os.environ.get(k)):
-                os.environ[k] = v
-
-_load_dotenv()
-
-# ══════════════════════════════════════════════════════════════
-# CONFIG — yahan apni values bhar do
-# ══════════════════════════════════════════════════════════════
-# Credentials are loaded only from environment variables or the gitignored .env file.
-API_ID = int(os.environ.get("API_ID", "0") or 0)
-API_HASH = os.environ.get("API_HASH", "").strip()
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
-SESSION_STRING = os.environ.get("SESSION_STRING", "").strip()
-_ids = os.environ.get("ADMIN_IDS", "")
-ADMIN_IDS = [int(x) for x in _ids.replace(" ", "").split(",") if x.lstrip("-").isdigit()]
-
-DATA = Path(__file__).resolve().parent / "data"
+CONFIG_DIR = Path.home() / ".config" / "telegram-copy-bot"
+CONFIG_FILE = CONFIG_DIR / "credentials.json"
+DATA = Path.home() / ".local" / "share" / "telegram-copy-bot"
 DATA.mkdir(parents=True, exist_ok=True)
+
+
+def _read_credentials() -> dict:
+    try:
+        value = json.loads(CONFIG_FILE.read_text())
+        if all(value.get(k) for k in ("api_id", "api_hash", "session_string")):
+            return value
+    except (OSError, ValueError, TypeError):
+        pass
+
+    # One-time migration from the previous wizard's repo-root .env, if present.
+    legacy = Path(__file__).resolve().parent / ".env"
+    parsed = {}
+    try:
+        for line in legacy.read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                key, value = line.split("=", 1)
+                parsed[key.strip()] = value.strip().strip('"').strip("'")
+        if all(parsed.get(k) for k in ("API_ID", "API_HASH", "SESSION_STRING")):
+            admin_ids = [
+                int(part.strip()) for part in parsed.get("ADMIN_IDS", "").split(",")
+                if part.strip().lstrip("-").isdigit()
+            ]
+            return {
+                "api_id": int(parsed["API_ID"]),
+                "api_hash": parsed["API_HASH"],
+                "session_string": parsed["SESSION_STRING"],
+                "phone": parsed.get("PHONE", ""),
+                "admin_ids": admin_ids,
+            }
+    except (OSError, ValueError, TypeError):
+        pass
+    return {}
+
+
+def _save_credentials(value: dict) -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    os.chmod(CONFIG_DIR, 0o700)
+    # Never persist the bot token; enter it privately each time the bot starts.
+    stored = {k: value[k] for k in (
+        "api_id", "api_hash", "phone", "session_string", "admin_ids"
+    ) if k in value}
+    tmp = CONFIG_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(stored, indent=2))
+    os.chmod(tmp, 0o600)
+    tmp.replace(CONFIG_FILE)
+    os.chmod(CONFIG_FILE, 0o600)
+
+
+async def _login_user(api_id: int, api_hash: str, phone: str):
+    client = Client(
+        "copybot_login", api_id=api_id, api_hash=api_hash,
+        in_memory=True, no_updates=True,
+    )
+    try:
+        await client.connect()
+        sent = await client.send_code(phone)
+        code = getpass.getpass("Telegram login code: ").strip().replace(" ", "")
+        try:
+            user = await client.sign_in(phone, sent.phone_code_hash, code)
+        except Exception as exc:
+            if type(exc).__name__ != "SessionPasswordNeeded":
+                raise
+            password = getpass.getpass("Telegram 2FA password: ")
+            user = await client.check_password(password)
+        session_string = await client.export_session_string()
+        if not session_string:
+            raise RuntimeError("Telegram ne session export nahi kiya.")
+        return session_string, user
+    finally:
+        if client.is_connected:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+
+
+async def _verify_user_session(value: dict):
+    client = Client(
+        "copybot_session_check",
+        api_id=int(value["api_id"]),
+        api_hash=value["api_hash"],
+        session_string=value["session_string"],
+        in_memory=True,
+        no_updates=True,
+    )
+    try:
+        await client.start()
+        return await client.get_me()
+    finally:
+        if client.is_connected:
+            try:
+                await client.stop()
+            except Exception:
+                pass
+
+
+async def _verify_bot_token(value: dict, token: str):
+    client = Client(
+        "copybot_token_check",
+        api_id=int(value["api_id"]),
+        api_hash=value["api_hash"],
+        bot_token=token,
+        in_memory=True,
+        no_updates=True,
+    )
+    try:
+        await client.start()
+        return await client.get_me()
+    finally:
+        if client.is_connected:
+            try:
+                await client.stop()
+            except Exception:
+                pass
+
+
+async def _terminal_setup() -> dict:
+    value = _read_credentials()
+    if value:
+        try:
+            user = await _verify_user_session(value)
+            print(f"\n✅ Saved Telegram session works: {user.first_name} (ID {user.id})")
+        except Exception as exc:
+            print(f"\n⚠️ Saved session invalid/unavailable ({type(exc).__name__}); fresh login karte hain.")
+            phone = input(f"Phone number with country code [{value.get('phone', '')}]: ").strip()
+            phone = phone or value.get("phone", "")
+            if not phone:
+                raise ValueError("Phone number zaroori hai.")
+            value["session_string"], user = await _login_user(
+                int(value["api_id"]), value["api_hash"], phone
+            )
+            value["phone"] = phone
+            _save_credentials(value)
+    else:
+        print("Telegram Copy Bot — first-time terminal setup\n")
+        api_id = int(input("Telegram API ID: ").strip())
+        api_hash = getpass.getpass("Telegram API Hash: ").strip()
+        phone = input("Phone number with country code (e.g. +91...): ").strip()
+        if not api_hash or not phone:
+            raise ValueError("API Hash aur phone number zaroori hain.")
+        session_string, user = await _login_user(api_id, api_hash, phone)
+        value = {
+            "api_id": api_id,
+            "api_hash": api_hash,
+            "phone": phone,
+            "session_string": session_string,
+        }
+        _save_credentials(value)
+        print(f"\n✅ Naya Telegram session ban gaya: {user.first_name} (ID {user.id})")
+
+    while True:
+        token = getpass.getpass("BotFather bot token: ").strip()
+        if not token:
+            print("Bot token khaali nahi ho sakta.")
+            continue
+        try:
+            bot_user = await _verify_bot_token(value, token)
+            break
+        except Exception as exc:
+            print(f"❌ Bot token login fail ({type(exc).__name__}); BotFather se token check karke dobara do.")
+
+    saved_admins = value.get("admin_ids") or [user.id]
+    if isinstance(saved_admins, str):
+        saved_admins = [part.strip() for part in saved_admins.split(",") if part.strip()]
+    default_admin = ",".join(map(str, saved_admins))
+    admin_text = input(f"Admin Telegram user ID(s) [{default_admin}]: ").strip()
+    admin_text = admin_text or default_admin
+    if not admin_text or not all(part.strip().isdigit() for part in admin_text.split(",")):
+        raise ValueError("Admin ID comma-separated numeric Telegram IDs honi chahiye.")
+    value["admin_ids"] = [int(part.strip()) for part in admin_text.split(",")]
+    _save_credentials(value)
+    legacy_env = Path(__file__).resolve().parent / ".env"
+    try:
+        legacy_env.unlink(missing_ok=True)
+    except OSError:
+        pass
+    value["bot_token"] = token
+    value["admin_ids"] = [int(x) for x in value["admin_ids"]]
+    print(f"✅ Bot token verified: @{bot_user.username or 'bot'}; starting now.\n")
+    return value
+
+
+if __name__ == "__main__":
+    try:
+        CONFIG = asyncio.run(_terminal_setup())
+    except (KeyboardInterrupt, EOFError):
+        print("\nSetup cancelled.")
+        raise SystemExit(1)
+    except Exception as exc:
+        print(f"Setup failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        raise SystemExit(1)
+else:
+    CONFIG = _read_credentials()
+
+API_ID = int(CONFIG.get("api_id", 0) or 0)
+API_HASH = str(CONFIG.get("api_hash", ""))
+BOT_TOKEN = str(CONFIG.get("bot_token", ""))
+SESSION_STRING = str(CONFIG.get("session_string", ""))
+ADMIN_IDS = [int(x) for x in CONFIG.get("admin_ids", [])]
+
 
 # ══════════════════════════════════════════════════════════════
 # SETTINGS
@@ -1012,7 +1183,7 @@ async def main():
             ("ADMIN_IDS", ADMIN_IDS),
         ) if not v]
         log.error("❌ Missing credentials: " + ", ".join(missing))
-        log.error("Run `bash run.sh` to configure credentials in the private .env file.")
+        log.error("Run `python3 bot.py` in a terminal to configure Telegram login.")
         return
 
     tasks_load()
