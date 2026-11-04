@@ -3,8 +3,9 @@
 
 Install requirements, then run ``python3 bot.py`` in a terminal. First run
 asks for Telegram API ID/hash, phone, login code/optional 2FA, bot token, and
-admin ID. The user session and settings are saved privately outside the repo;
-the bot token is entered each time and is never written to disk.
+admin ID. The user session and settings are saved privately outside the repo.
+An existing repo-root .env is read-only and is never deleted. The bot token
+comes from BOT_TOKEN when available, otherwise it is entered privately.
 """
 
 import asyncio
@@ -41,14 +42,8 @@ DATA.mkdir(parents=True, exist_ok=True)
 
 
 def _read_credentials() -> dict:
-    try:
-        value = json.loads(CONFIG_FILE.read_text())
-        if all(value.get(k) for k in ("api_id", "api_hash", "session_string")):
-            return value
-    except (OSError, ValueError, TypeError):
-        pass
-
-    # One-time migration from the previous wizard's repo-root .env, if present.
+    # Read an existing repo-root .env without changing or deleting it. Real
+    # environment variables (including GitHub Codespaces secrets) win.
     legacy = Path(__file__).resolve().parent / ".env"
     parsed = {}
     try:
@@ -57,6 +52,24 @@ def _read_credentials() -> dict:
             if line and not line.startswith("#") and "=" in line:
                 key, value = line.split("=", 1)
                 parsed[key.strip()] = value.strip().strip('"').strip("'")
+    except OSError:
+        pass
+
+    for key in ("API_ID", "API_HASH", "SESSION_STRING", "PHONE", "ADMIN_IDS", "BOT_TOKEN"):
+        if os.environ.get(key):
+            parsed[key] = os.environ[key].strip()
+
+    try:
+        value = json.loads(CONFIG_FILE.read_text())
+        if all(value.get(k) for k in ("api_id", "api_hash", "session_string")):
+            # The externally saved session remains authoritative, but a token
+            # supplied by .env/Codespaces does not need to be typed again.
+            value["bot_token"] = parsed.get("BOT_TOKEN", "")
+            return value
+    except (OSError, ValueError, TypeError):
+        pass
+
+    try:
         if all(parsed.get(k) for k in ("API_ID", "API_HASH", "SESSION_STRING")):
             admin_ids = [
                 int(part.strip()) for part in parsed.get("ADMIN_IDS", "").split(",")
@@ -68,8 +81,9 @@ def _read_credentials() -> dict:
                 "session_string": parsed["SESSION_STRING"],
                 "phone": parsed.get("PHONE", ""),
                 "admin_ids": admin_ids,
+                "bot_token": parsed.get("BOT_TOKEN", ""),
             }
-    except (OSError, ValueError, TypeError):
+    except (ValueError, TypeError):
         pass
     return {}
 
@@ -77,7 +91,7 @@ def _read_credentials() -> dict:
 def _save_credentials(value: dict) -> None:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     os.chmod(CONFIG_DIR, 0o700)
-    # Never persist the bot token; enter it privately each time the bot starts.
+    # Never persist the bot token here; use BOT_TOKEN or enter it privately.
     stored = {k: value[k] for k in (
         "api_id", "api_hash", "phone", "session_string", "admin_ids"
     ) if k in value}
@@ -168,7 +182,9 @@ async def _terminal_setup() -> dict:
         _save_credentials(value)
         print(f"\n✅ Naya Telegram session ban gaya: {user.first_name} (ID {user.id})")
 
-    token = getpass.getpass("BotFather bot token: ").strip()
+    token = os.environ.get("BOT_TOKEN", "").strip() or str(value.get("bot_token", "")).strip()
+    if not token:
+        token = getpass.getpass("BotFather bot token: ").strip()
     if not token:
         raise ValueError("Bot token khaali nahi ho sakta.")
 
@@ -182,11 +198,8 @@ async def _terminal_setup() -> dict:
         raise ValueError("Admin ID comma-separated numeric Telegram IDs honi chahiye.")
     value["admin_ids"] = [int(part.strip()) for part in admin_text.split(",")]
     _save_credentials(value)
-    legacy_env = Path(__file__).resolve().parent / ".env"
-    try:
-        legacy_env.unlink(missing_ok=True)
-    except OSError:
-        pass
+    # Never remove the user's .env/session. It may be their only workspace
+    # backup; .gitignore keeps it out of GitHub commits.
     value["bot_token"] = token
     value["admin_ids"] = [int(x) for x in value["admin_ids"]]
     print("✅ Setup complete; starting the bot now.\n")
@@ -216,28 +229,52 @@ ADMIN_IDS = [int(x) for x in CONFIG.get("admin_ids", [])]
 # SETTINGS
 # ══════════════════════════════════════════════════════════════
 SETTINGS = {
-    "parallel": 2,          # ek task mein ek saath kitni files
-    "batch_size": 5,
+    "parallel": 5,          # continuous workers per task
+    "batch_size": 10,       # queue lookahead; not a blocking batch anymore
     "max_tasks": 3,
-    "global_concurrency": 4,
+    "global_concurrency": 10,
     "disk_reserve_gb": 1,
-    "delay": 0.3,
+    "delay": 0.2,           # optional pacing after a file
+    "retry_delay": 2.0,     # normal errors: 2s, then at most 3s
 }
 
 SETTINGS_FILE = DATA / "settings.json"
 
 def load_settings():
+    saved = {}
     if SETTINGS_FILE.exists():
         try:
-            SETTINGS.update(json.loads(SETTINGS_FILE.read_text()))
+            value = json.loads(SETTINGS_FILE.read_text())
+            if isinstance(value, dict):
+                saved = value
+                SETTINGS.update(value)
         except Exception:
             pass
 
+    # Migrate the old default (2 per task, 4 globally), otherwise the saved
+    # settings would silently keep the new 5-worker engine capped at 2/4.
+    if saved.get("parallel") == 2 and saved.get("global_concurrency", 4) == 4:
+        SETTINGS["parallel"] = 5
+        SETTINGS["global_concurrency"] = 10
+
+    # Corrupt/old settings must not create unbounded workers or negative waits.
+    SETTINGS["parallel"] = min(5, max(1, int(SETTINGS.get("parallel", 5))))
+    SETTINGS["batch_size"] = min(100, max(SETTINGS["parallel"], int(SETTINGS.get("batch_size", 10))))
+    SETTINGS["max_tasks"] = min(10, max(1, int(SETTINGS.get("max_tasks", 3))))
+    SETTINGS["global_concurrency"] = min(
+        50, max(SETTINGS["parallel"], int(SETTINGS.get("global_concurrency", 10)))
+    )
+    SETTINGS["delay"] = min(3.0, max(0.0, float(SETTINGS.get("delay", 0.2))))
+    SETTINGS["retry_delay"] = min(3.0, max(2.0, float(SETTINGS.get("retry_delay", 2.0))))
+    save_settings()
+
 def save_settings():
     try:
-        SETTINGS_FILE.write_text(json.dumps(SETTINGS, indent=1))
-    except Exception:
-        pass
+        tmp = SETTINGS_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(SETTINGS, indent=1))
+        tmp.replace(SETTINGS_FILE)
+    except Exception as e:
+        log.warning(f"settings save fail: {e}")
 
 # ══════════════════════════════════════════════════════════════
 # LOGGING
@@ -388,7 +425,9 @@ async def acc_client() -> Client:
             in_memory=True,
             no_updates=True,
             workers=32,
-            sleep_threshold=60,
+            # Surface FloodWait to the per-worker handler instead of letting
+            # Pyrogram hide up to 60s of sleeping inside one transfer call.
+            sleep_threshold=1,
         )
         await _acc.start()
         me = await _acc.get_me()
@@ -485,7 +524,34 @@ async def transfer_one(acc: Client, dst, msg, mtype, mobj) -> tuple[bool, int]:
 # ══════════════════════════════════════════════════════════════
 TASKS: dict[int, dict] = {}
 COUNTER = {"n": 0}
-GLOBAL_SEM: asyncio.Semaphore  # initialized in main()
+
+
+class DynamicLimiter:
+    """Async concurrency limit whose ceiling can change between transfers."""
+
+    def __init__(self, limit: int):
+        self._limit = max(1, int(limit))
+        self._active = 0
+        self._condition = asyncio.Condition()
+
+    async def set_limit(self, limit: int):
+        async with self._condition:
+            self._limit = max(1, int(limit))
+            self._condition.notify_all()
+
+    async def __aenter__(self):
+        async with self._condition:
+            await self._condition.wait_for(lambda: self._active < self._limit)
+            self._active += 1
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        async with self._condition:
+            self._active -= 1
+            self._condition.notify_all()
+
+
+GLOBAL_SEM: DynamicLimiter  # initialized in main()
 TASKS_FILE = DATA / "tasks.json"
 
 def tasks_save():
@@ -521,6 +587,12 @@ async def run_task(tid: int):
         return
     t["status"] = "running"
     t["runner"] = asyncio.current_task()
+    t["abort"] = False
+    t["flood_waits"] = {}
+    # Done records are replayed from durable state below. Reset counters so a
+    # restart/resume cannot count already-copied files twice.
+    t["done"] = 0
+    t["failed"] = 0
     tasks_save()
 
     src = t["src"]
@@ -531,128 +603,230 @@ async def run_task(tid: int):
 
     try:
         acc = await acc_client()
+        parallel = min(5, max(1, int(SETTINGS.get("parallel", 5))))
+        queue_size = max(parallel, int(SETTINGS.get("batch_size", 10)))
+        queue = asyncio.Queue(maxsize=queue_size)
+        t["active_parallel"] = parallel
 
-        sem = asyncio.Semaphore(int(SETTINGS.get("parallel", 2)))
-        batch = max(1, int(SETTINGS.get("batch_size", 5)))
+        def stop_requested() -> bool:
+            return bool(t.get("cancel") or t.get("abort"))
 
-        async def copy_one(msg):
+        async def wait_if_paused():
+            while t.get("paused") and not stop_requested():
+                await asyncio.sleep(0.2)
+
+        async def copy_one(msg, worker_id: int):
             mid = str(msg.id)
+            await wait_if_paused()
+            if stop_requested():
+                return
+
             rec = st["files"].get(mid, {})
             if rec.get("status") == "done":
                 t["done"] = t.get("done", 0) + 1
                 return
 
-            if t.get("cancel") or t.get("paused"):
+            mtype, mobj = get_media(msg)
+            if not mtype:
                 return
 
-            async with sem:
-                async with GLOBAL_SEM:
-                    if t.get("cancel"):
-                        return
-                    while t.get("paused"):
-                        await asyncio.sleep(1)
-                    if t.get("cancel"):
-                        return
-
-                    mtype, mobj = get_media(msg)
-                    if not mtype:
-                        return
-
-                    for attempt in range(3):
-                        try:
-                            ok, used = await transfer_one(acc, dst, msg, mtype, mobj)
-                            if ok:
-                                st["files"][mid] = {"status": "done", "ts": time.time()}
-                                t["done"] = t.get("done", 0) + 1
-                                t["bytes"] = t.get("bytes", 0) + used * 2
-                            else:
-                                st["files"][mid] = {"status": "failed"}
-                                t["failed"] = t.get("failed", 0) + 1
-                            state_save(st)
-                            break
-                        except FloodWait as e:
-                            wait = int(e.value) + 2
-                            log.info(f"FloodWait {wait}s")
-                            await asyncio.sleep(wait)
-                        except StopTask as e:
-                            t["status"] = f"stopped:{e}"
-                            t["note"] = str(e)
-                            tasks_save()
+            attempt = 0
+            while not stop_requested():
+                await wait_if_paused()
+                if stop_requested():
+                    return
+                try:
+                    # Hold a global slot only for actual network work. It is
+                    # released during FloodWait/retry/pacing sleeps.
+                    async with GLOBAL_SEM:
+                        if stop_requested():
                             return
-                        except Exception as e:
-                            if any(x in type(e).__name__ or x in str(e) for x in WRITE_ERR):
-                                t["status"] = f"error: write forbidden on dst"
-                                tasks_save()
-                                return
-                            if attempt == 2:
-                                st["files"][mid] = {"status": "failed"}
-                                t["failed"] = t.get("failed", 0) + 1
-                                state_save(st)
-                            await asyncio.sleep(2 ** attempt)
+                        ok, used = await transfer_one(acc, dst, msg, mtype, mobj)
 
-                    t["elapsed"] = time.time() - start
-                    tasks_save()
-                    await asyncio.sleep(float(SETTINGS.get("delay", 0.3)))
-
-        if want:
-            # A requested count is capped during scanning, so we can show an
-            # exact total before copying, as in the original behaviour.
-            found = []
-            t["scanning"] = True
-            async for m in acc.get_chat_history(src):
-                if not m or getattr(m, "empty", False):
-                    continue
-                if not get_media(m)[0]:
-                    continue
-                found.append(m)
-                if len(found) >= want:
-                    break
-            found.sort(key=lambda m: m.id)
-            t["total"] = len(found)
-            t["scanning"] = False
-            tasks_save()
-            for i in range(0, len(found), batch):
-                if t.get("cancel"):
-                    break
-                await asyncio.gather(*(copy_one(m) for m in found[i:i + batch]))
-                state_save(st)
-                tasks_save()
-        else:
-            # For "all", do not wait minutes to scan the whole channel before
-            # sending anything. Stream media in Telegram's history order and
-            # update an approximate total as batches are discovered.
-            t["scanning"] = True
-            t["total"] = 0
-            chunk = []
-            async for m in acc.get_chat_history(src):
-                if t.get("cancel"):
-                    break
-                if not m or getattr(m, "empty", False) or not get_media(m)[0]:
-                    continue
-                t["total"] = t.get("total", 0) + 1
-                chunk.append(m)
-                if len(chunk) >= batch:
-                    await asyncio.gather(*(copy_one(item) for item in chunk))
+                    if ok:
+                        st["files"][mid] = {"status": "done", "ts": time.time()}
+                        t["done"] = t.get("done", 0) + 1
+                        t["bytes"] = t.get("bytes", 0) + used * 2
+                    else:
+                        st["files"][mid] = {"status": "failed"}
+                        t["failed"] = t.get("failed", 0) + 1
                     state_save(st)
+                    break
+
+                except FloodWait as e:
+                    # FloodWait is per worker and never consumes one of the 3
+                    # normal error attempts. Other workers keep copying.
+                    wait = max(1, int(getattr(e, "value", 1)) + 1)
+                    t["flood_waits"][worker_id] = time.time() + wait
+                    log.info(
+                        f"task={tid} worker={worker_id} mid={mid} "
+                        f"FloodWait={wait}s; other workers continue"
+                    )
+                    try:
+                        await asyncio.sleep(wait)
+                    finally:
+                        t["flood_waits"].pop(worker_id, None)
+                    continue
+
+                except StopTask as e:
+                    t["abort"] = True
+                    t["status"] = f"stopped:{e}"
+                    t["note"] = str(e)
                     tasks_save()
-                    chunk.clear()
-            if chunk and not t.get("cancel"):
-                await asyncio.gather(*(copy_one(item) for item in chunk))
-                state_save(st)
-            t["scanning"] = False
-            if not t.get("cancel"):
+                    return
+
+                except Exception as e:
+                    if any(x in type(e).__name__ or x in str(e) for x in WRITE_ERR):
+                        t["abort"] = True
+                        t["status"] = "error: write forbidden on dst"
+                        tasks_save()
+                        return
+
+                    attempt += 1
+                    if attempt >= 3:
+                        st["files"][mid] = {"status": "failed"}
+                        t["failed"] = t.get("failed", 0) + 1
+                        state_save(st)
+                        log.warning(
+                            f"task={tid} mid={mid} failed after 3 attempts: "
+                            f"{type(e).__name__}: {e}"
+                        )
+                        break
+
+                    # No long exponential backoff: normally 2s, then max 3s.
+                    base = float(SETTINGS.get("retry_delay", 2.0))
+                    retry_wait = min(3.0, max(2.0, base * attempt))
+                    log.info(
+                        f"task={tid} worker={worker_id} mid={mid} "
+                        f"retry {attempt}/3 in {retry_wait:g}s"
+                    )
+                    await asyncio.sleep(retry_wait)
+
+            t["elapsed"] = time.time() - start
+            tasks_save()
+            delay = float(SETTINGS.get("delay", 0.2))
+            if delay > 0 and not stop_requested():
+                await asyncio.sleep(delay)
+
+        async def worker(worker_id: int):
+            while True:
+                msg = await queue.get()
+                try:
+                    if msg is None or stop_requested():
+                        return
+                    await copy_one(msg, worker_id)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    log.error(f"task={tid} worker={worker_id} crashed: {e}", exc_info=True)
+                    t["abort"] = True
+                    t["status"] = f"error: {e}"
+                    return
+                finally:
+                    queue.task_done()
+
+        async def enqueue(msg) -> bool:
+            # A full queue normally applies backpressure. The short timeout
+            # also lets cancellation/abort break out instead of deadlocking.
+            while not stop_requested():
+                try:
+                    queue.put_nowait(msg)
+                    return True
+                except asyncio.QueueFull:
+                    await asyncio.sleep(0.05)
+            return False
+
+        async def history():
+            """Resume history after a scan FloodWait without duplicating items."""
+            offset_id = 0
+            while not stop_requested():
+                try:
+                    async for m in acc.get_chat_history(src, offset_id=offset_id):
+                        mid = int(getattr(m, "id", 0) or 0)
+                        if mid and mid == offset_id:
+                            continue
+                        if mid:
+                            offset_id = mid
+                        yield m
+                    return
+                except FloodWait as e:
+                    wait = max(1, int(getattr(e, "value", 1)) + 1)
+                    t["flood_waits"]["scanner"] = time.time() + wait
+                    log.info(f"task={tid} history FloodWait={wait}s; queued copies continue")
+                    try:
+                        await asyncio.sleep(wait)
+                    finally:
+                        t["flood_waits"].pop("scanner", None)
+
+        async def produce():
+            if want:
+                # Keep exact totals for a requested count, then feed the same
+                # continuous queue instead of waiting on fixed batches.
+                found = []
+                t["scanning"] = True
+                async for m in history():
+                    if stop_requested():
+                        break
+                    if not m or getattr(m, "empty", False) or not get_media(m)[0]:
+                        continue
+                    found.append(m)
+                    if len(found) >= want:
+                        break
+                found.sort(key=lambda m: m.id)
+                t["total"] = len(found)
+                t["scanning"] = False
+                tasks_save()
+                for msg in found:
+                    if not await enqueue(msg):
+                        break
+            else:
+                # Scan and copy simultaneously; a full queue, not a completed
+                # batch, is the only thing that briefly pauses the scanner.
+                t["scanning"] = True
+                t["total"] = 0
+                async for m in history():
+                    if stop_requested():
+                        break
+                    if not m or getattr(m, "empty", False) or not get_media(m)[0]:
+                        continue
+                    if not await enqueue(m):
+                        break
+                    t["total"] = t.get("total", 0) + 1
+                t["scanning"] = False
                 tasks_save()
 
-        if not t.get("cancel") and not str(t.get("status", "")).startswith(("error", "stopped")):
+        workers = [asyncio.create_task(worker(i + 1)) for i in range(parallel)]
+        try:
+            await produce()
+            if stop_requested():
+                for item in workers:
+                    item.cancel()
+            else:
+                for _ in workers:
+                    await queue.put(None)
+            await asyncio.gather(*workers)
+        finally:
+            t["scanning"] = False
+            for item in workers:
+                if not item.done():
+                    item.cancel()
+            await asyncio.gather(*workers, return_exceptions=True)
+            t["flood_waits"].clear()
+            state_save(st)
+
+        t["elapsed"] = time.time() - start
+        if not stop_requested() and not str(t.get("status", "")).startswith(("error", "stopped")):
             t["status"] = "done"
         tasks_save()
 
     except asyncio.CancelledError:
         t["status"] = "cancelled"
+        t["scanning"] = False
         tasks_save()
     except Exception as e:
         log.error(f"task {tid} crashed: {e}", exc_info=True)
         t["status"] = f"error: {e}"
+        t["scanning"] = False
         tasks_save()
 
 def start_task(tid: int):
@@ -788,8 +962,18 @@ def _task_text(t) -> str:
         f"✅ Done: {done} | ❌ Failed: {t.get('failed',0)}\n"
         f"📶 Data: {hr(t.get('bytes',0))}{speed}\n"
         f"⏱ {elapsed/60:.1f} min\n"
+        f"⚡ Workers: <b>{t.get('active_parallel', SETTINGS['parallel'])}</b>\n"
         f"Status: <b>{esc(t.get('status','?'))}</b>"
     )
+    flood_left = [
+        max(0, int(until - time.time() + 0.999))
+        for until in (t.get("flood_waits") or {}).values()
+    ]
+    if flood_left:
+        txt += (
+            f"\n🌊 FloodWait: {max(flood_left)}s — affected worker wait kar raha hai; "
+            "baaki workers active hain."
+        )
     if t.get("note"):
         txt += f"\n\n⚠️ {esc(t['note'])[:300]}"
     return txt
@@ -900,20 +1084,25 @@ async def cb_settings(c: Client, q: CallbackQuery):
         return
     txt = (
         f"⚙️ <b>Settings</b>\n\n"
-        f"⚡ parallel (per task): <b>{SETTINGS['parallel']}</b>\n"
-        f"📦 batch size: <b>{SETTINGS['batch_size']}</b>\n"
+        f"⚡ parallel workers (per task): <b>{SETTINGS['parallel']}</b>\n"
+        f"📦 queue size: <b>{SETTINGS['batch_size']}</b>\n"
         f"🧵 max tasks: <b>{SETTINGS['max_tasks']}</b>\n"
         f"🌐 global parallel: <b>{SETTINGS['global_concurrency']}</b>\n"
         f"💾 disk reserve: <b>{SETTINGS['disk_reserve_gb']}GB</b> "
         f"(free now: {hr(disk_free())})\n"
-        f"⏳ delay between files: <b>{SETTINGS['delay']}s</b>\n\n"
-        f"<i>Stream-delete ON — upload ke baad local file turant delete</i>"
+        f"⏳ normal gap: <b>{SETTINGS['delay']}s</b> | retry: <b>2–3s</b>\n\n"
+        f"<i>Continuous queue ON — slow file/FloodWait poora batch nahi rokta. "
+        f"FloodWait wala worker poora wait karta hai, baaki kaam karte hain.</i>\n"
+        f"<i>Stream-delete ON — upload ke baad local file turant delete.</i>\n"
+        f"<i>Parallel change naye ya resumed task par apply hoga.</i>"
     )
     await safe_edit(q.message, txt, kb(
         [("⚡ par=1", "s_par_1"), ("⚡ par=2", "s_par_2"), ("⚡ par=3", "s_par_3")],
-        [("📦 batch=3", "s_bat_3"), ("📦 batch=5", "s_bat_5"), ("📦 batch=10", "s_bat_10")],
+        [("⚡ par=4", "s_par_4"), ("⚡ par=5", "s_par_5")],
+        [("📦 queue=5", "s_bat_5"), ("📦 queue=10", "s_bat_10"), ("📦 queue=20", "s_bat_20")],
         [("🧵 tasks=2", "s_tsk_2"), ("🧵 tasks=3", "s_tsk_3")],
-        [("⏳ delay=0.2", "s_dly_2"), ("⏳ delay=0.5", "s_dly_5"), ("⏳ delay=1", "s_dly_10")],
+        [("⏳ gap=0", "s_dly_0"), ("⏳ gap=0.2", "s_dly_2"),
+         ("⏳ gap=2", "s_dly_20"), ("⏳ gap=3", "s_dly_30")],
         [("◀ Menu", "menu")],
     ))
 
@@ -924,9 +1113,14 @@ async def cb_setting(c: Client, q: CallbackQuery):
     kind = q.matches[0].group(1)
     val = int(q.matches[0].group(2))
     if kind == "par":
-        SETTINGS["parallel"] = val
+        SETTINGS["parallel"] = min(5, max(1, val))
+        SETTINGS["global_concurrency"] = max(
+            SETTINGS["parallel"], int(SETTINGS.get("global_concurrency", 10))
+        )
+        if "GLOBAL_SEM" in globals():
+            await GLOBAL_SEM.set_limit(SETTINGS["global_concurrency"])
     elif kind == "bat":
-        SETTINGS["batch_size"] = val
+        SETTINGS["batch_size"] = max(int(SETTINGS["parallel"]), val)
     elif kind == "tsk":
         SETTINGS["max_tasks"] = val
     elif kind == "dly":
@@ -1175,7 +1369,7 @@ async def main():
     global GLOBAL_SEM
 
     load_settings()
-    GLOBAL_SEM = asyncio.Semaphore(int(SETTINGS.get("global_concurrency", 4)))
+    GLOBAL_SEM = DynamicLimiter(int(SETTINGS.get("global_concurrency", 10)))
 
     if not all([API_ID, API_HASH, BOT_TOKEN, SESSION_STRING, ADMIN_IDS]):
         missing = [k for k, v in (
