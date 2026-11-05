@@ -28,8 +28,8 @@ except ImportError:
 
 # Set your real Telegram numeric ID here. Send /start to the running bot once
 # to see your ID in the access-denied reply. Keep this source file private.
-OWNER_ID = 0
-OWNER_USERNAME = "@theheads"  # placeholder; replace with your Telegram username (no spaces)
+OWNER_ID = 7191422858
+OWNER_USERNAME = "@krishnachaurasiaa"  # placeholder; replace with your Telegram username (no spaces)
 
 # All runtime credentials and data are kept outside the Git repository.
 APP_DIR = Path.home() / ".local" / "share" / "combined-telegram-bot"
