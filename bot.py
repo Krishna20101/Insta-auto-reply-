@@ -9,6 +9,7 @@ shown by the bot.
 import asyncio
 import getpass
 import html
+import json
 import os
 import re
 import sqlite3
@@ -28,11 +29,13 @@ except ImportError:
 
 # Set your real Telegram numeric ID here. Send /start to the running bot once
 # to see your ID in the access-denied reply. Keep this source file private.
-OWNER_ID = 7191422858
-OWNER_USERNAME = "@krishnachaurasiaa"  # placeholder; replace with your Telegram username (no spaces)
+OWNER_ID = int(os.environ.get("OWNER_ID", "7191422858"))
+OWNER_USERNAME = os.environ.get("OWNER_USERNAME", "@krishnachaurasiaa")
 
-# All runtime credentials and data are kept outside the Git repository.
-APP_DIR = Path.home() / ".local" / "share" / "combined-telegram-bot"
+# Render: mount a persistent disk and set BOT_DATA_DIR=/var/data/combined-telegram-bot.
+# Local runs default to a private directory outside the Git repository.
+APP_DIR = Path(os.environ.get("BOT_DATA_DIR", "") or
+               (Path.home() / ".local" / "share" / "combined-telegram-bot"))
 APP_DIR.mkdir(parents=True, exist_ok=True)
 os.chmod(APP_DIR, 0o700)
 DB_PATH = APP_DIR / "bot.sqlite3"
@@ -88,15 +91,20 @@ def set_config(key: str, value: str) -> None:
     os.chmod(DB_PATH, 0o600)
 
 
+def configured_admin_ids() -> set[int]:
+    return {int(part.strip()) for part in os.environ.get("ADMIN_IDS", "").split(",")
+            if part.strip().isdigit()}
+
+
 def is_admin(user_id: int) -> bool:
-    if OWNER_ID > 0 and user_id == OWNER_ID:
+    if (OWNER_ID > 0 and user_id == OWNER_ID) or user_id in configured_admin_ids():
         return True
     with connect_db() as conn:
         return conn.execute("SELECT 1 FROM admins WHERE user_id=?", (user_id,)).fetchone() is not None
 
 
 def admin_ids() -> list[int]:
-    ids = [OWNER_ID] if OWNER_ID > 0 else []
+    ids = ([OWNER_ID] if OWNER_ID > 0 else []) + sorted(configured_admin_ids())
     with connect_db() as conn:
         ids.extend(row[0] for row in conn.execute("SELECT user_id FROM admins ORDER BY user_id"))
     return ids
@@ -147,6 +155,38 @@ def save_session(owner_id: int, label: str, api_id: int, api_hash: str,
         session_id = int(cur.lastrowid)
     os.chmod(DB_PATH, 0o600)
     return session_id
+
+
+def seed_sessions_from_environment() -> int:
+    """Load optional pre-created sessions from Render's private environment config."""
+    raw = os.environ.get("USER_SESSIONS_JSON", "").strip()
+    if not raw:
+        return 0
+    try:
+        entries = json.loads(raw)
+        if not isinstance(entries, list):
+            raise ValueError("USER_SESSIONS_JSON must be a JSON array.")
+    except (ValueError, TypeError) as exc:
+        raise ValueError(f"Invalid USER_SESSIONS_JSON: {exc}") from exc
+
+    added = 0
+    for item in entries:
+        owner_id = int(item.get("owner_id", OWNER_ID))
+        label = str(item.get("label", "Telegram login"))[:64]
+        api_id = int(item["api_id"])
+        api_hash = str(item["api_hash"])
+        phone = str(item.get("phone", ""))
+        session_string = str(item["session_string"])
+        if owner_id <= 0 or not api_hash or not session_string:
+            raise ValueError("Each USER_SESSIONS_JSON entry needs owner_id, api_id, api_hash, and session_string.")
+        with connect_db() as conn:
+            exists = conn.execute(
+                "SELECT 1 FROM sessions WHERE owner_id=? AND label=?", (owner_id, label)
+            ).fetchone()
+        if not exists:
+            save_session(owner_id, label, api_id, api_hash, phone, session_string)
+            added += 1
+    return added
 
 
 def delete_session(session_id: int, owner_id: int) -> bool:
@@ -267,7 +307,8 @@ async def terminal_login(owner_id: int):
 
 
 def parse_cli():
-    if len(sys.argv) >= 2 and sys.argv[1].lower() == "login":
+    command = sys.argv[1].lower() if len(sys.argv) >= 2 else ""
+    if command == "login":
         if len(sys.argv) < 3 or not sys.argv[2].isdigit():
             print("Usage: python3 bot.py login <your-telegram-user-id>")
             raise SystemExit(2)
@@ -280,12 +321,79 @@ def parse_cli():
             print(f"Login failed: {type(exc).__name__}: {exc}", file=sys.stderr)
             raise SystemExit(1)
         raise SystemExit(0)
+    if command == "export":
+        if len(sys.argv) != 4 or not all(x.isdigit() for x in sys.argv[2:]):
+            print("Usage: python3 bot.py export <telegram-user-id> <profile-id>")
+            raise SystemExit(2)
+        init_db()
+        owner_id, profile_id = map(int, sys.argv[2:])
+        row = get_session(profile_id, owner_id)
+        if not row:
+            print("Profile not found for that Telegram user ID.", file=sys.stderr)
+            raise SystemExit(1)
+        print("WARNING: this JSON contains account credentials. Keep it private; never paste it into chat or GitHub.", file=sys.stderr)
+        if input("Type EXPORT to print it for Render's private environment variable: ").strip() != "EXPORT":
+            raise SystemExit(1)
+        print(json.dumps([{
+            "owner_id": owner_id,
+            "label": row["label"],
+            "api_id": row["api_id"],
+            "api_hash": row["api_hash"],
+            "phone": row["phone"],
+            "session_string": row["session_string"],
+        }]))
+        raise SystemExit(0)
+
+
+def load_runtime_config():
+    init_db()
+    interactive = sys.stdin.isatty()
+    env_id = os.environ.get("BOT_API_ID") or os.environ.get("API_ID")
+    env_hash = os.environ.get("BOT_API_HASH") or os.environ.get("API_HASH")
+    env_token = os.environ.get("BOT_TOKEN")
+
+    saved_id = get_config("bot_api_id")
+    saved_hash = get_config("bot_api_hash")
+    api_id_text = env_id or saved_id
+    if not api_id_text and interactive:
+        api_id_text = input("Telegram API ID: ").strip()
+    api_hash = env_hash or saved_hash
+    if not api_hash and interactive:
+        api_hash = getpass.getpass("Telegram API Hash: ").strip()
+    token = env_token or ""
+    if not token and interactive:
+        token = getpass.getpass("BotFather bot token: ").strip()
+
+    missing = [name for name, value in (
+        ("BOT_API_ID", api_id_text), ("BOT_API_HASH", api_hash), ("BOT_TOKEN", token)
+    ) if not value]
+    if missing:
+        raise RuntimeError("Missing environment variables for non-interactive hosting: " + ", ".join(missing))
+    api_id = int(api_id_text)
+    if interactive:
+        set_config("bot_api_id", str(api_id))
+        set_config("bot_api_hash", api_hash)
+    return api_id, api_hash, token
 
 
 parse_cli()
 
 
 # Menu helpers are defined before Client so callback handlers use this one bot.
+def login_instructions(user_id: int) -> str:
+    if os.environ.get("RENDER"):
+        return (
+            "Render has no interactive login terminal. On a trusted local terminal, create a login with "
+            f"<code>python3 bot.py login {user_id}</code>, then export it with "
+            "<code>python3 bot.py export USER_ID PROFILE_ID</code>. Put the resulting JSON array in Render's private "
+            "<code>USER_SESSIONS_JSON</code> environment variable and redeploy. Never send that JSON in chat."
+        )
+    return (
+        "Open a second trusted Codespaces terminal and run "
+        f"<code>python3 bot.py login {user_id}</code>. Never send login codes or 2FA passwords to this bot."
+    )
+
+
 def session_picker_rows(user_id: int, mode: str):
     rows = []
     for row in user_sessions(user_id):
@@ -297,27 +405,14 @@ def session_picker_rows(user_id: int, mode: str):
 
 
 if __name__ == "__main__":
-    init_db()
     try:
-        saved_id = get_config("bot_api_id")
-        BOT_API_ID = int(saved_id or input("Telegram API ID: ").strip())
-        if not saved_id:
-            set_config("bot_api_id", str(BOT_API_ID))
-        BOT_API_HASH = get_config("bot_api_hash")
-        if not BOT_API_HASH:
-            BOT_API_HASH = getpass.getpass("Telegram API Hash: ").strip()
-            if not BOT_API_HASH:
-                raise ValueError("Telegram API Hash is required.")
-            set_config("bot_api_hash", BOT_API_HASH)
-        BOT_TOKEN = getpass.getpass("BotFather bot token: ").strip()
-        if not BOT_TOKEN:
-            raise ValueError("Bot token is required.")
-    except (KeyboardInterrupt, EOFError, ValueError) as exc:
-        print(f"Setup stopped: {exc}", file=sys.stderr)
+        BOT_API_ID, BOT_API_HASH, BOT_TOKEN = load_runtime_config()
+    except (KeyboardInterrupt, EOFError, ValueError, RuntimeError) as exc:
+        print(f"Startup configuration error: {exc}", file=sys.stderr)
         raise SystemExit(2)
 else:
-    BOT_API_ID = int(os.environ.get("API_ID", "0") or 0)
-    BOT_API_HASH = os.environ.get("API_HASH", "")
+    BOT_API_ID = int(os.environ.get("BOT_API_ID", os.environ.get("API_ID", "0")) or 0)
+    BOT_API_HASH = os.environ.get("BOT_API_HASH", os.environ.get("API_HASH", ""))
     BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 
 bot = Client("combined_bot", api_id=BOT_API_ID, api_hash=BOT_API_HASH,
@@ -392,12 +487,7 @@ async def menu_callbacks(c: Client, q: CallbackQuery):
             reply_markup=keyboard([("◀ Menu", "menu_home")]), parse_mode=enums.ParseMode.HTML)
     elif action == "menu_login":
         rows = session_picker_rows(uid, "login")
-        text = (
-            "🔐 <b>Your saved logins</b>\n\n"
-            "Choose a saved account, or open a second trusted Codespaces terminal and run:\n"
-            f"<code>python3 bot.py login {uid}</code>\n\n"
-            "For account safety, never send login codes or 2FA passwords to this bot."
-        )
+        text = "🔐 <b>Your saved logins</b>\n\n" + login_instructions(uid)
         await q.message.edit_text(text, reply_markup=keyboard(*rows), parse_mode=enums.ParseMode.HTML)
     elif action == "menu_sessions":
         rows = []
@@ -418,8 +508,7 @@ async def menu_callbacks(c: Client, q: CallbackQuery):
         rows = session_picker_rows(uid, mode)
         if not user_sessions(uid):
             await q.message.edit_text(
-                "🔐 No saved login yet. Open a second trusted Codespaces terminal and run:\n"
-                f"<code>python3 bot.py login {uid}</code>",
+                "🔐 <b>No saved login yet.</b>\n\n" + login_instructions(uid),
                 reply_markup=keyboard([("🔐 Login", "menu_login"), ("◀ Menu", "menu_home")]),
                 parse_mode=enums.ParseMode.HTML)
         else:
@@ -847,23 +936,63 @@ async def receive_text(c: Client, m: Message):
         await begin_job(uid, flow, start_id=start_id, order="oldest", progress_message=progress)
 
 
+async def _health_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+    try:
+        await reader.readline()
+        while True:
+            line = await reader.readline()
+            if line in (b"\r\n", b"\n", b""):
+                break
+        body = b"OK\n"
+        writer.write(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n"
+            + f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode()
+            + body
+        )
+        await writer.drain()
+    except Exception:
+        pass
+    finally:
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+
+
 async def main():
     init_db()
-    if not BOT_TOKEN:
-        raise RuntimeError("Enter a valid BotFather token in the terminal.")
-    await bot.start()
-    me = await bot.get_me()
-    print(f"Bot @{me.username} is online. Master owner ID: {OWNER_ID}.")
+    if not BOT_TOKEN or not BOT_API_ID or not BOT_API_HASH:
+        raise RuntimeError("Set BOT_TOKEN, BOT_API_ID, and BOT_API_HASH in the host environment.")
+    imported = seed_sessions_from_environment()
+    if imported:
+        print(f"Loaded {imported} preconfigured user login(s).")
+
+    health_server = None
+    port = os.environ.get("PORT")
+    if port:
+        health_server = await asyncio.start_server(_health_handler, "0.0.0.0", int(port))
+        print(f"Render health endpoint listening on port {port}.")
+
+    bot_started = False
     try:
+        await bot.start()
+        bot_started = True
+        me = await bot.get_me()
+        print(f"Bot @{me.username} is online. Master owner ID: {OWNER_ID}.")
         await idle()
     finally:
+        if health_server:
+            health_server.close()
+            await health_server.wait_closed()
         for client in list(USER_CLIENTS.values()):
             if client.is_connected:
                 try:
                     await client.stop()
                 except Exception:
                     pass
-        await bot.stop()
+        if bot_started:
+            await bot.stop()
 
 
 if __name__ == "__main__":
