@@ -41,7 +41,6 @@ DB_PATH = APP_DIR / "bot.sqlite3"
 def connect_db():
     conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
     return conn
 
 
@@ -69,6 +68,8 @@ def init_db():
                 value TEXT NOT NULL
             );
         """)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA secure_delete=ON")
     os.chmod(DB_PATH, 0o600)
 
 
@@ -393,7 +394,7 @@ async def menu_callbacks(c: Client, q: CallbackQuery):
         rows = session_picker_rows(uid, "login")
         text = (
             "🔐 <b>Your saved logins</b>\n\n"
-            "Choose a saved account, or add one from the trusted Codespaces terminal:\n"
+            "Choose a saved account, or open a second trusted Codespaces terminal and run:\n"
             f"<code>python3 bot.py login {uid}</code>\n\n"
             "For account safety, never send login codes or 2FA passwords to this bot."
         )
@@ -417,7 +418,7 @@ async def menu_callbacks(c: Client, q: CallbackQuery):
         rows = session_picker_rows(uid, mode)
         if not user_sessions(uid):
             await q.message.edit_text(
-                "🔐 No saved login yet. Add one from the trusted terminal first:\n"
+                "🔐 No saved login yet. Open a second trusted Codespaces terminal and run:\n"
                 f"<code>python3 bot.py login {uid}</code>",
                 reply_markup=keyboard([("🔐 Login", "menu_login"), ("◀ Menu", "menu_home")]),
                 parse_mode=enums.ParseMode.HTML)
